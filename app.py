@@ -52,7 +52,7 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
     return image_paths
 
 
-def send_images_to_rails(image_paths, space_id, origin):
+def send_images_to_rails(image_paths, space_id):
     url = f"{RAILS_BASE_URL}/api/v1/spaces/{space_id}/addimages"
     files = [("imgs[]", open(path, "rb")) for path in image_paths]
     headers = {'Origin': ORIGIN_URL}
@@ -127,7 +127,7 @@ def parse():
 
         # 2. Extract and upload images
         image_paths = extract_images_from_pdf(file_path)
-        image_upload_result = send_images_to_rails(image_paths, space_id, origin)
+        image_upload_result = send_images_to_rails(image_paths, space_id)
 
         return jsonify({
             "text": parsed_text,
