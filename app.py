@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify
-
 from playwright.sync_api import sync_playwright
 from utils.robots import is_scraping_allowed
 from flask_cors import CORS
@@ -66,6 +65,33 @@ def send_images_to_rails(image_paths, space_id, origin):
     except Exception as e:
         return {"error": str(e)}
 
+# === ROBOTS.TXT + SCRAPE ===
+def is_scraping_allowed(url):
+    parsed_url = urlparse(url)
+    robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
+
+    rp = urllib.robotparser.RobotFileParser()
+    rp.set_url(robots_url)
+
+    try:
+        rp.read()
+        return rp.can_fetch("*", url)
+    except Exception as e:
+        print(f"⚠️ robots.txt check failed: {e}")
+        return False
+
+
+def scrape_with_playwright(url):
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle")
+        content = page.content()
+        browser.close()
+        return content
+
+
+
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
@@ -79,21 +105,8 @@ def scrape():
         return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-dev-shm-usage',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-gpu'
-                ]
-            )
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle")
-            content = page.content()
-            browser.close()
-            return jsonify({"html": content})
+        html = scrape_with_playwright(url)
+        return jsonify({"html": html})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
