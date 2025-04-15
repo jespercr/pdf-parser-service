@@ -4,3 +4,4 @@ gunicorn
 flask-cors
 PyMuPDF
 requests
+playwright

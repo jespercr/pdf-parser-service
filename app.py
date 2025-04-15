@@ -1,4 +1,7 @@
 from flask import Flask, request, jsonify
+
+from playwright.sync_api import sync_playwright
+from utils.robots import is_scraping_allowed
 from flask_cors import CORS
 import os
 import fitz  # PyMuPDF
@@ -49,7 +52,7 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
 
 
 def send_images_to_rails(image_paths, space_id):
-    url = f"{RAILS_BASE_URL}/spaces/{space_id}/add_images"
+    url = f"{RAILS_BASE_URL}/spaces/{space_id}/addimages"
     files = [("imgs[]", open(path, "rb")) for path in image_paths]
 
     try:
@@ -60,6 +63,28 @@ def send_images_to_rails(image_paths, space_id):
     except Exception as e:
         return {"error": str(e)}
 
+
+@app.route("/scrape", methods=["POST"])
+def scrape():
+    data = request.get_json()
+    url = data.get("url")
+
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    if not is_scraping_allowed(url):
+        return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            content = page.content()
+            browser.close()
+            return jsonify({"html": content})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/parse", methods=["POST"])
 def parse():
