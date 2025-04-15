@@ -1,3 +1,6 @@
 Flask
 pdfplumber
 gunicorn
+flask-cors
+PyMuPDF
+requests
