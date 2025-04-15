@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
+from urllib.parse import urlparse
+import urllib.robotparser
 from utils.robots import is_scraping_allowed
 from flask_cors import CORS
 import os
