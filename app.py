@@ -13,7 +13,7 @@ CORS(app)
 
 
 # === CONFIG ===
-RAILS_BASE_URL = "https://workplacerback.onrender.com/api/v1"  # Replace with your actual domain
+RAILS_BASE_URL = "https://workplacerback.onrender.com"  # Replace with your actual domain
 # ==============
 
 
@@ -52,11 +52,12 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
 
 
 def send_images_to_rails(image_paths, space_id):
-    url = f"{RAILS_BASE_URL}/spaces/{space_id}/addimages"
+    url = f"{RAILS_BASE_URL}/api/v1/spaces/{space_id}/addimages"
     files = [("imgs[]", open(path, "rb")) for path in image_paths]
+    headers = {'Origin': RAILS_BASE_URL}
 
     try:
-        response = requests.post(url, files=files)
+        response = requests.post(url, files=files, headers=headers)
         for _, f in files:
             f.close()
         return response.json() if response.status_code == 200 else {"error": response.text}
@@ -77,7 +78,13 @@ def scrape():
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            browser = p.chromium.launch(
+                args=[
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox'
+                ]
+            )
             page = browser.new_page()
             page.goto(url, wait_until="networkidle")
             content = page.content()
