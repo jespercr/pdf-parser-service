@@ -101,13 +101,9 @@ def scrape():
 def parse():
     file = request.files.get("file")
     space_id = request.form.get("space_id")
-    origin = request.headers.get('Origin')
 
     if not file or not space_id:
         return jsonify({"error": "Missing file or space_id"}), 400
-
-    if not origin:
-        return jsonify({"error": "Missing Origin header"}), 400
 
     file_path = f"/tmp/{file.filename}"
     file.save(file_path)
