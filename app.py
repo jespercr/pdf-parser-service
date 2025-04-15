@@ -13,7 +13,9 @@ CORS(app)
 
 
 # === CONFIG ===
-RAILS_BASE_URL = "https://workplacerback.onrender.com"  # Replace with your actual domain
+RAILS_BASE_URL = "https://workplacerback.onrender.com" 
+ # Replace with your actual domain
+ORIGIN_URL = "https://pdf-parser-service.onrender.com"
 # ==============
 
 
@@ -51,10 +53,10 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
     return image_paths
 
 
-def send_images_to_rails(image_paths, space_id):
+def send_images_to_rails(image_paths, space_id, origin):
     url = f"{RAILS_BASE_URL}/api/v1/spaces/{space_id}/addimages"
     files = [("imgs[]", open(path, "rb")) for path in image_paths]
-    headers = {'Origin': RAILS_BASE_URL}
+    headers = {'Origin': ORIGIN_URL}
 
     try:
         response = requests.post(url, files=files, headers=headers)
@@ -79,10 +81,12 @@ def scrape():
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
+                headless=True,
                 args=[
                     '--disable-dev-shm-usage',
                     '--no-sandbox',
-                    '--disable-setuid-sandbox'
+                    '--disable-setuid-sandbox',
+                    '--disable-gpu'
                 ]
             )
             page = browser.new_page()
@@ -97,9 +101,13 @@ def scrape():
 def parse():
     file = request.files.get("file")
     space_id = request.form.get("space_id")
+    origin = request.headers.get('Origin')
 
     if not file or not space_id:
         return jsonify({"error": "Missing file or space_id"}), 400
+
+    if not origin:
+        return jsonify({"error": "Missing Origin header"}), 400
 
     file_path = f"/tmp/{file.filename}"
     file.save(file_path)
@@ -110,7 +118,7 @@ def parse():
 
         # 2. Extract and upload images
         image_paths = extract_images_from_pdf(file_path)
-        image_upload_result = send_images_to_rails(image_paths, space_id)
+        image_upload_result = send_images_to_rails(image_paths, space_id, origin)
 
         return jsonify({
             "text": parsed_text,
