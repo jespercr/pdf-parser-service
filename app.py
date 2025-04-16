@@ -41,8 +41,9 @@ PLAYWRIGHT_PATHS = [
 ]
 
 # Scraping configs
-PAGE_TIMEOUT = 60000  # 60 seconds
-NAVIGATION_TIMEOUT = 30000  # 30 seconds
+PAGE_TIMEOUT = 20000  # 20 seconds
+NAVIGATION_TIMEOUT = 15000  # 15 seconds
+CONTENT_WAIT_TIMEOUT = 5000  # 5 seconds
 # ==============
 
 @app.before_request
@@ -243,7 +244,7 @@ def scrape_with_playwright(url):
             page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
 
             logger.info(f"🌐 Navigating to URL: {url}")
-            response = page.goto(url)
+            response = page.goto(url, wait_until="domcontentloaded")
             
             if not response:
                 logger.error("❌ Failed to get response from page")
@@ -253,10 +254,6 @@ def scrape_with_playwright(url):
             if response.status >= 400:
                 logger.error(f"❌ Page returned error status code: {response.status}")
                 raise Exception(f"Page returned status code: {response.status}")
-
-            logger.info("⏳ Waiting for page load...")
-            page.wait_for_load_state("domcontentloaded")
-            logger.info("✅ DOM content loaded")
             
             # Handle cookie consent only if dialog is present
             logger.info("🍪 Checking for cookie consent dialog...")
@@ -288,13 +285,13 @@ def scrape_with_playwright(url):
                             if page.locator(selector).count() > 0:
                                 page.locator(selector).first.click()
                                 logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
-                                # Wait for cookie dialog to disappear
-                                page.wait_for_timeout(2000)
+                                # Short wait for cookie dialog to disappear
+                                page.wait_for_timeout(1000)
                                 break
                         except Exception as e:
                             continue
                     
-                    # Verify cookie banner is gone
+                    # Quick verify cookie banner is gone
                     if page.locator('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]').count() > 0:
                         logger.warning("⚠️ Cookie dialog might still be present")
                 else:
@@ -302,8 +299,9 @@ def scrape_with_playwright(url):
             except Exception as e:
                 logger.warning(f"⚠️ Cookie consent check failed, but continuing: {str(e)}")
             
-            # Wait for the main content to load
+            # Wait for the main content to load with a shorter timeout
             logger.info("⏳ Waiting for main content...")
+            content_found = False
             try:
                 # Wait for specific content elements that indicate the actual listing content
                 content_selectors = [
@@ -318,36 +316,39 @@ def scrape_with_playwright(url):
                     'h1'  # At minimum, wait for the main heading
                 ]
                 
-                # Wait for at least one of these selectors to appear
+                # Try to find any content element with a short timeout
                 for selector in content_selectors:
                     try:
-                        element = page.wait_for_selector(selector, timeout=5000)
+                        element = page.wait_for_selector(selector, timeout=CONTENT_WAIT_TIMEOUT)
                         if element:
                             logger.info(f"✅ Found content with selector: {selector}")
+                            content_found = True
                             break
                     except Exception:
                         continue
                 
-                # Additional wait for any dynamic content
-                page.wait_for_timeout(2000)
+                if not content_found:
+                    logger.warning("⚠️ No specific content elements found, proceeding with general content")
                 
             except Exception as e:
                 logger.warning(f"⚠️ Waiting for content elements failed: {str(e)}")
             
+            # Quick network idle check
             try:
-                logger.info("⏳ Waiting for network idle...")
-                page.wait_for_load_state("networkidle", timeout=5000)
+                page.wait_for_load_state("networkidle", timeout=3000)
                 logger.info("✅ Network is idle")
             except Exception as e:
                 logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
 
-            # Scroll the page to trigger any lazy loading
-            logger.info("📜 Scrolling page for lazy loading...")
+            # Quick scroll for lazy loading
+            logger.info("📜 Quick scroll for lazy loading...")
             page.evaluate("""
-                window.scrollTo(0, document.body.scrollHeight);
-                new Promise((resolve) => setTimeout(resolve, 1000));
-                window.scrollTo(0, 0);
+                window.scrollTo(0, document.body.scrollHeight/2);
+                setTimeout(() => window.scrollTo(0, 0), 500);
             """)
+            
+            # Short wait for any final content
+            page.wait_for_timeout(1000)
             
             logger.info("📥 Getting page content...")
             html_content = page.content()
@@ -355,16 +356,13 @@ def scrape_with_playwright(url):
             # Clean and structure the HTML content
             cleaned_data = clean_html_response(html_content)
             
-            # Verify we got actual content and not terms/cookie page
-            if any(term in cleaned_data["content"].lower() for term in ["villkor", "cookie", "consent", "gdpr", "terms", "conditions"]):
+            # Quick verify we got actual content and not terms/cookie page
+            if any(term in cleaned_data["content"].lower()[:200] for term in ["villkor", "cookie", "consent", "gdpr", "terms", "conditions"]):
                 logger.warning("⚠️ Got terms/cookie page instead of content, trying alternative extraction...")
                 try:
-                    # Try to find the actual content again after a delay
-                    page.wait_for_timeout(2000)
-                    # Refresh the page
-                    page.reload()
-                    page.wait_for_load_state("domcontentloaded")
-                    page.wait_for_timeout(2000)
+                    # Quick retry with a refresh
+                    page.reload(wait_until="domcontentloaded")
+                    page.wait_for_timeout(1000)
                     
                     # Get updated content
                     html_content = page.content()
@@ -388,6 +386,13 @@ def scrape_with_playwright(url):
                 except:
                     logger.error("Failed to close browser after error")
             raise Exception(f"Failed to scrape URL: {str(e)}")
+        finally:
+            if 'browser' in locals():
+                try:
+                    browser.close()
+                    logger.info("🎭 Browser closed")
+                except:
+                    logger.error("Failed to close browser")
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
