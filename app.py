@@ -9,6 +9,19 @@ import os
 import fitz  # PyMuPDF
 import requests
 import pdfplumber
+import logging
+import sys
+import traceback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -122,58 +135,77 @@ def find_chromium_executable():
     raise FileNotFoundError("Chromium executable not found. Please ensure Playwright browsers are installed.")
 
 def scrape_with_playwright(url):
+    logger.info(f"🚀 Starting scrape for URL: {url}")
     executable_path = find_chromium_executable()
+    logger.info(f"🎭 Using Chromium at: {executable_path}")
+    
     with sync_playwright() as p:
         try:
+            logger.info("📱 Launching browser...")
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
-                    "--disable-dev-shm-usage",  # Disable /dev/shm usage
-                    "--disable-gpu",  # Disable GPU hardware acceleration
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
                 ],
                 executable_path=executable_path
             )
             
+            logger.info("🌍 Creating browser context...")
             context = browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             )
             
+            logger.info("📄 Creating new page...")
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT)
             page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
 
-            print(f"🌐 Navigating to URL: {url}")
+            logger.info(f"🌐 Navigating to URL: {url}")
             response = page.goto(url)
             
             if not response:
+                logger.error("❌ Failed to get response from page")
                 raise Exception("Failed to get response from page")
             
+            logger.info(f"📡 Response status: {response.status}")
             if response.status >= 400:
+                logger.error(f"❌ Page returned error status code: {response.status}")
                 raise Exception(f"Page returned status code: {response.status}")
 
-            # Wait for either networkidle or load event, whichever comes first
-            print("⏳ Waiting for page to load...")
+            logger.info("⏳ Waiting for page load...")
             page.wait_for_load_state("domcontentloaded")
+            logger.info("✅ DOM content loaded")
             
             try:
-                page.wait_for_load_state("networkidle", timeout=5000)  # Short timeout for networkidle
+                logger.info("⏳ Waiting for network idle...")
+                page.wait_for_load_state("networkidle", timeout=5000)
+                logger.info("✅ Network is idle")
             except Exception as e:
-                print(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
+                logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
 
-            print("📄 Getting page content...")
+            logger.info("📥 Getting page content...")
             content = page.content()
+            content_length = len(content)
+            logger.info(f"📦 Content retrieved, length: {content_length} characters")
             
             context.close()
             browser.close()
+            logger.info("🎭 Browser closed successfully")
             
             return content
             
         except Exception as e:
-            print(f"🚨 Scraping error: {str(e)}")
+            logger.error(f"🚨 Scraping error: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
             if 'browser' in locals():
-                browser.close()
+                try:
+                    browser.close()
+                    logger.info("🎭 Browser closed after error")
+                except:
+                    logger.error("Failed to close browser after error")
             raise Exception(f"Failed to scrape URL: {str(e)}")
 
 
@@ -181,20 +213,29 @@ def scrape_with_playwright(url):
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    data = request.get_json()
-    url = data.get("url")
-
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    if not is_scraping_allowed(url):
-        return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
-
+    logger.info("📨 Received scrape request")
     try:
+        data = request.get_json()
+        logger.info(f"📝 Request data: {data}")
+        
+        url = data.get("url")
+        if not url:
+            logger.error("❌ No URL provided in request")
+            return jsonify({"error": "No URL provided"}), 400
+
+        logger.info(f"🔍 Checking if scraping is allowed for: {url}")
+        if not is_scraping_allowed(url):
+            logger.error("🚫 Scraping disallowed by robots.txt")
+            return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
+
+        logger.info("🤖 Starting scraping process...")
         html = scrape_with_playwright(url)
+        logger.info("✅ Scraping completed successfully")
+        
         return jsonify({"html": html})
     except Exception as e:
-        print("🚨 Scraping failed:", e)
+        error_msg = f"🚨 Scraping failed: {str(e)}\n{traceback.format_exc()}"
+        logger.error(error_msg)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/parse", methods=["POST"])
