@@ -245,13 +245,27 @@ def scrape_with_playwright(url):
 def clean_html_response(html_content):
     """
     Clean and structure HTML content using BeautifulSoup.
-    Returns a dictionary containing cleaned title, description, and main content.
+    More aggressively extracts only property-relevant information.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Remove script and style elements
-    for element in soup(['script', 'style']):
+    # Remove script, style, and footer elements
+    for element in soup(['script', 'style', 'footer', 'iframe']):
         element.decompose()
+        
+    # Remove all elements containing policy-related content
+    policy_terms = ['cookie', 'gdpr', 'privacy', 'policy', 'villkor', 'consent', 'personuppgift', 
+                   'integritet', 'acceptera', 'godkänn', 'samtycke', 'rättigheter']
+                   
+    # First pass: remove elements with policy terms in their attributes
+    for element in soup.find_all(lambda tag: any(term in (tag.get('id', '') + tag.get('class', '') + tag.get('title', '')).lower() for term in policy_terms)):
+        element.decompose()
+    
+    # Second pass: remove elements with policy terms in their text
+    for element in soup.find_all(text=lambda text: text and any(term in text.lower() for term in policy_terms)):
+        parent = element.parent
+        if parent:
+            parent.decompose()
     
     # Get title - prefer h1 over title tag
     title = ""
@@ -267,42 +281,75 @@ def clean_html_response(html_content):
     if meta_tag and meta_tag.get('content'):
         meta_desc = meta_tag['content']
     
-    # Extract main content - use targeted approach for property listings
+    # Extract main content using multiple strategies
     content_text = ""
     
-    # Try to find property-specific elements
-    property_classes = ['property-info', 'property-details', 'listing-details', 'object-info']
-    property_content = None
+    # Strategy 1: Look for property-specific containers
+    property_classes = [
+        'property-info', 'property-details', 'listing-details', 'object-info',
+        'property-description', 'estate-info', 'listing-description'
+    ]
     
+    # Try each class separately to find meaningful content
     for cls in property_classes:
         elements = soup.find_all(class_=lambda x: x and cls.lower() in x.lower())
         if elements:
-            property_content = elements[0]
-            break
+            for element in elements:
+                text = element.get_text(separator=' ', strip=True)
+                if len(text) > 100 and not any(term in text.lower() for term in policy_terms):
+                    content_text = text
+                    break
+            if content_text:
+                break
     
-    if property_content:
-        # We found property content, use it
-        content_text = property_content.get_text(separator=' ', strip=True)
-    else:
-        # Fallback: collect all paragraphs that are substantial
+    # Strategy 2: If no property container found, look for specific sections
+    if not content_text:
+        # Find sections that likely contain property details
+        sections = []
+        # Check for transportation info
+        transport = soup.find_all(string=lambda text: text and any(term in text.lower() for term in ['kollektivt', 'kommunikation', 'pendel', 'transport', 'buss', 'station']))
+        for t in transport:
+            if t.parent and len(t.parent.get_text(strip=True)) > 50:
+                sections.append(t.parent.get_text(separator=' ', strip=True))
+        
+        # Check for property features
+        features = soup.find_all(string=lambda text: text and any(term in text.lower() for term in ['parkering', 'garage', 'restaurang', 'service', 'hyresgäst']))
+        for f in features:
+            if f.parent and len(f.parent.get_text(strip=True)) > 50:
+                sections.append(f.parent.get_text(separator=' ', strip=True))
+        
+        # Combine the sections if we found any
+        if sections:
+            content_text = ' '.join(sections)
+    
+    # Strategy 3: Last resort - collect all substantial paragraphs
+    if not content_text or len(content_text) < 100:
         paragraphs = []
         for p in soup.find_all('p'):
             text = p.get_text(strip=True)
-            if len(text) > 30 and not any(term in text.lower() for term in ['cookie', 'consent', 'gdpr', 'villkor']):
+            if len(text) > 30 and not any(term in text.lower() for term in policy_terms):
                 paragraphs.append(text)
         
-        content_text = ' '.join(paragraphs)
+        if paragraphs:
+            content_text = ' '.join(paragraphs)
     
-    # If content is too small, try an alternative approach
-    if len(content_text) < 100:
-        # Get all divs with substantial text
-        for div in soup.find_all('div'):
-            text = div.get_text(strip=True)
-            if len(text) > 200 and not any(term in text.lower() for term in ['cookie', 'consent', 'gdpr', 'villkor']):
-                content_text = text
-                break
+    # Filter out policy text sentences
+    if content_text:
+        clean_sentences = []
+        for sentence in re.split(r'(?<=[.!?])\s+', content_text):
+            if len(sentence) > 10 and not any(term in sentence.lower() for term in policy_terms):
+                clean_sentences.append(sentence)
+        
+        content_text = ' '.join(clean_sentences)
     
-    # Final cleaning
+    # Extract the actual property information from the start of the description
+    if "Kontorsfastighet" in content_text:
+        property_start = content_text.find("Kontorsfastighet")
+        if property_start >= 0:
+            # Only keep text from this point forward
+            content_text = content_text[property_start:]
+    
+    # Clean up the text
     content_text = re.sub(r'\s+', ' ', content_text).strip()
     
     return {
