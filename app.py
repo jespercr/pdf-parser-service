@@ -12,6 +12,9 @@ import pdfplumber
 import logging
 import sys
 import traceback
+from datetime import datetime
+from bs4 import BeautifulSoup
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -29,8 +32,7 @@ CORS(app)
 
 # === CONFIG ===
 RAILS_BASE_URL = "https://workplacerback.onrender.com" 
- # Replace with your actual domain
-ORIGIN_URL = "https://pdf-parser-service.onrender.com"
+ORIGIN_URL = "https://workplacer-micro.onrender.com"
 
 # Check both potential Chromium locations
 PLAYWRIGHT_PATHS = [
@@ -43,6 +45,15 @@ PAGE_TIMEOUT = 60000  # 60 seconds
 NAVIGATION_TIMEOUT = 30000  # 30 seconds
 # ==============
 
+@app.before_request
+def log_request_info():
+    logger.info("=== New Request ===")
+    logger.info(f"Method: {request.method}")
+    logger.info(f"URL: {request.url}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    if request.is_json:
+        logger.info(f"JSON Body: {request.get_json()}")
+    logger.info("==================")
 
 def parse_pdf_text(pdf_path):
     text = ""
@@ -134,6 +145,47 @@ def find_chromium_executable():
     print("❌ Chromium executable not found in any location")
     raise FileNotFoundError("Chromium executable not found. Please ensure Playwright browsers are installed.")
 
+def clean_html_response(html_content):
+    """
+    Clean and structure HTML content using BeautifulSoup.
+    Returns a dictionary containing cleaned title, description, and main content.
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Remove script and style elements
+    for element in soup(['script', 'style']):
+        element.decompose()
+    
+    # Get title
+    title = soup.title.string if soup.title else ""
+    
+    # Get meta description
+    meta_desc = ""
+    meta_tag = soup.find('meta', attrs={'name': 'description'}) or soup.find('meta', attrs={'property': 'og:description'})
+    if meta_tag and meta_tag.get('content'):
+        meta_desc = meta_tag['content']
+    
+    # Try to find main content
+    main_content = ""
+    # First try specific content containers
+    content_candidates = soup.find_all(['article', 'main', 'div'], class_=lambda x: x and any(term in str(x).lower() for term in ['content', 'article', 'main']))
+    
+    if content_candidates:
+        main_content = content_candidates[0].get_text(separator=' ', strip=True)
+    else:
+        # Fallback: get all paragraph text
+        paragraphs = soup.find_all('p')
+        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs)
+    
+    # Clean up the text
+    main_content = re.sub(r'\s+', ' ', main_content).strip()
+    
+    return {
+        "title": title,
+        "description": meta_desc,
+        "content": main_content
+    }
+
 def scrape_with_playwright(url):
     logger.info(f"🚀 Starting scrape for URL: {url}")
     executable_path = find_chromium_executable()
@@ -187,16 +239,17 @@ def scrape_with_playwright(url):
                 logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
 
             logger.info("📥 Getting page content...")
-            content = page.content()
-            content_length = len(content)
-            logger.info(f"📦 Content retrieved, length: {content_length} characters")
+            html_content = page.content()
             
-            context.close()
-            browser.close()
-            logger.info("🎭 Browser closed successfully")
+            # Clean and structure the HTML content
+            cleaned_data = clean_html_response(html_content)
             
-            return content
-            
+            logger.info("✅ Successfully scraped and cleaned content")
+            return {
+                "success": True,
+                "data": cleaned_data
+            }
+
         except Exception as e:
             logger.error(f"🚨 Scraping error: {str(e)}")
             logger.error(f"Stack trace: {traceback.format_exc()}")
@@ -208,13 +261,16 @@ def scrape_with_playwright(url):
                     logger.error("Failed to close browser after error")
             raise Exception(f"Failed to scrape URL: {str(e)}")
 
-
-
-
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    logger.info("📨 Received scrape request")
+    request_start_time = datetime.now()
+    logger.info(f"📨 Received scrape request at {request_start_time}")
+    
     try:
+        if not request.is_json:
+            logger.error("❌ Request is not JSON")
+            return jsonify({"error": "Content-Type must be application/json"}), 400
+            
         data = request.get_json()
         logger.info(f"📝 Request data: {data}")
         
@@ -229,12 +285,20 @@ def scrape():
             return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
 
         logger.info("🤖 Starting scraping process...")
-        html = scrape_with_playwright(url)
-        logger.info("✅ Scraping completed successfully")
-        
-        return jsonify({"html": html})
+        try:
+            scraped_data = scrape_with_playwright(url)
+            request_duration = (datetime.now() - request_start_time).total_seconds()
+            logger.info(f"✅ Scraping completed successfully in {request_duration} seconds")
+            
+            return jsonify(scraped_data)
+            
+        except Exception as e:
+            logger.error(f"🚨 Scraping error: {str(e)}")
+            logger.error(f"Stack trace: {traceback.format_exc()}")
+            return jsonify({"error": str(e)}), 500
+            
     except Exception as e:
-        error_msg = f"🚨 Scraping failed: {str(e)}\n{traceback.format_exc()}"
+        error_msg = f"🚨 Request processing failed: {str(e)}\n{traceback.format_exc()}"
         logger.error(error_msg)
         return jsonify({"error": str(e)}), 500
 

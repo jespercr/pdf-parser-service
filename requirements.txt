@@ -5,3 +5,4 @@ flask-cors
 PyMuPDF
 requests
 playwright
+beautifulsoup4==4.12.3
