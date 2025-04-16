@@ -20,7 +20,6 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . .
 
 # Set Playwright path and install Chromium
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install chromium
 
 # Expose port and run

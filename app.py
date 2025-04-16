@@ -85,10 +85,26 @@ def is_scraping_allowed(url):
         print(f"⚠️ robots.txt check failed: {e}")
         return False
    
+def find_chromium_executable():
+    base = Path.home() / ".cache/ms-playwright"
+    print("🗂 Checking Chromium install path:", base)
+
+    folders = list(base.glob("chromium-*"))
+    print("📁 Chromium folders found:", folders)
+
+    for item in folders:
+        executable = item / "chrome-linux/chrome"
+        if executable.exists():
+            print("✅ Chromium executable found at:", executable)
+            return str(executable)
+
+    print("❌ Chromium executable not found in expected location.")
+    raise FileNotFoundError("Chromium executable not found")
 
 def scrape_with_playwright(url):
+    executable_path = find_chromium_executable()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"], executable_path=PLAYWRIGHT_PATH)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"], executable_path=executable_path)
         page = browser.new_page()
         page.goto(url, wait_until="networkidle")
         content = page.content()
@@ -113,6 +129,7 @@ def scrape():
         html = scrape_with_playwright(url)
         return jsonify({"html": html})
     except Exception as e:
+        print("🚨 Scraping failed:", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/parse", methods=["POST"])
