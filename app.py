@@ -258,44 +258,49 @@ def scrape_with_playwright(url):
             page.wait_for_load_state("domcontentloaded")
             logger.info("✅ DOM content loaded")
             
-            # Handle cookie consent
-            logger.info("🍪 Handling cookie consent...")
+            # Handle cookie consent only if dialog is present
+            logger.info("🍪 Checking for cookie consent dialog...")
             try:
-                # Wait for cookie dialog
-                page.wait_for_selector('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]', timeout=5000)
+                # Quick check if cookie dialog exists
+                has_cookie_dialog = page.locator('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]').count() > 0
                 
-                # Try different common cookie consent button selectors
-                consent_selectors = [
-                    'button:has-text("Tillåt alla")',
-                    'button:has-text("Acceptera alla")',
-                    'button:has-text("Godkänn alla")',
-                    'button:has-text("Accept all")',
-                    'button:has-text("Allow all")',
-                    '[id*="accept-all"]',
-                    '[class*="accept-all"]',
-                    '[id*="acceptAll"]',
-                    '[class*="acceptAll"]',
-                    'button[id*="accept"]',
-                    'button[class*="accept"]',
-                    'button[id*="consent"]',
-                    'button[class*="consent"]'
-                ]
-                
-                for selector in consent_selectors:
-                    try:
-                        if page.locator(selector).count() > 0:
-                            page.locator(selector).first.click()
-                            logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
-                            # Wait for cookie dialog to disappear
-                            page.wait_for_timeout(2000)
-                            break
-                    except Exception as e:
-                        continue
-                
-                # Ensure cookie banner is gone
-                page.wait_for_selector('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]', state="hidden", timeout=5000)
+                if has_cookie_dialog:
+                    logger.info("🍪 Cookie dialog found, handling consent...")
+                    # Try different common cookie consent button selectors
+                    consent_selectors = [
+                        'button:has-text("Tillåt alla")',
+                        'button:has-text("Acceptera alla")',
+                        'button:has-text("Godkänn alla")',
+                        'button:has-text("Accept all")',
+                        'button:has-text("Allow all")',
+                        '[id*="accept-all"]',
+                        '[class*="accept-all"]',
+                        '[id*="acceptAll"]',
+                        '[class*="acceptAll"]',
+                        'button[id*="accept"]',
+                        'button[class*="accept"]',
+                        'button[id*="consent"]',
+                        'button[class*="consent"]'
+                    ]
+                    
+                    for selector in consent_selectors:
+                        try:
+                            if page.locator(selector).count() > 0:
+                                page.locator(selector).first.click()
+                                logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
+                                # Wait for cookie dialog to disappear
+                                page.wait_for_timeout(2000)
+                                break
+                        except Exception as e:
+                            continue
+                    
+                    # Verify cookie banner is gone
+                    if page.locator('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]').count() > 0:
+                        logger.warning("⚠️ Cookie dialog might still be present")
+                else:
+                    logger.info("✅ No cookie dialog found, proceeding with content extraction")
             except Exception as e:
-                logger.warning(f"⚠️ Cookie consent handling failed, but continuing: {str(e)}")
+                logger.warning(f"⚠️ Cookie consent check failed, but continuing: {str(e)}")
             
             # Wait for the main content to load
             logger.info("⏳ Waiting for main content...")
