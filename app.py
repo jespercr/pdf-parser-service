@@ -152,8 +152,12 @@ def clean_html_response(html_content):
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Remove script and style elements
+    # Remove script, style elements and cookie-related content
     for element in soup(['script', 'style']):
+        element.decompose()
+    
+    # Remove cookie-related elements
+    for element in soup.find_all(class_=lambda x: x and any(term in str(x).lower() for term in ['cookie', 'consent', 'gdpr'])):
         element.decompose()
     
     # Get title
@@ -165,20 +169,39 @@ def clean_html_response(html_content):
     if meta_tag and meta_tag.get('content'):
         meta_desc = meta_tag['content']
     
-    # Try to find main content
+    # Try to find main content with more specific selectors
     main_content = ""
-    # First try specific content containers
-    content_candidates = soup.find_all(['article', 'main', 'div'], class_=lambda x: x and any(term in str(x).lower() for term in ['content', 'article', 'main']))
     
-    if content_candidates:
-        main_content = content_candidates[0].get_text(separator=' ', strip=True)
-    else:
-        # Fallback: get all paragraph text
+    # Priority list of content selectors
+    content_selectors = [
+        # Property specific selectors
+        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['property-info', 'property-details', 'property-description'])},
+        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['listing-details', 'listing-description'])},
+        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['object-info', 'object-details'])},
+        # Generic content selectors
+        {'tag': ['article', 'main'], 'class_': None},
+        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['content', 'article', 'main'])}
+    ]
+    
+    # Try each selector in order
+    for selector in content_selectors:
+        elements = soup.find_all(selector['tag'], class_=selector['class_'])
+        if elements:
+            # Get the largest content block
+            content_block = max(elements, key=lambda x: len(x.get_text(strip=True)))
+            main_content = content_block.get_text(separator=' ', strip=True)
+            break
+    
+    # If no content found, fall back to paragraphs
+    if not main_content:
         paragraphs = soup.find_all('p')
-        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs)
+        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50)  # Only include substantial paragraphs
     
     # Clean up the text
     main_content = re.sub(r'\s+', ' ', main_content).strip()
+    
+    # Remove any remaining cookie-related content
+    main_content = re.sub(r'(?i)(cookie|consent|gdpr).*?(\.|$)', '', main_content)
     
     return {
         "title": title,
@@ -231,6 +254,36 @@ def scrape_with_playwright(url):
             page.wait_for_load_state("domcontentloaded")
             logger.info("✅ DOM content loaded")
             
+            # Handle cookie consent
+            logger.info("🍪 Handling cookie consent...")
+            try:
+                # Try different common cookie consent button selectors
+                consent_selectors = [
+                    'button[id*="accept"]',
+                    'button[class*="accept"]',
+                    'button[id*="consent"]',
+                    'button[class*="consent"]',
+                    'button:has-text("Accept")',
+                    'button:has-text("Accept all")',
+                    'button:has-text("Acceptera")',
+                    'button:has-text("Godkänn")',
+                    'button:has-text("Tillåt")',
+                    'button:has-text("Tillåt alla")'
+                ]
+                
+                for selector in consent_selectors:
+                    try:
+                        if page.locator(selector).count() > 0:
+                            page.locator(selector).first.click()
+                            logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
+                            # Wait for any animations/transitions
+                            page.wait_for_timeout(1000)
+                            break
+                    except Exception as e:
+                        continue
+            except Exception as e:
+                logger.warning(f"⚠️ Cookie consent handling failed, but continuing: {str(e)}")
+            
             try:
                 logger.info("⏳ Waiting for network idle...")
                 page.wait_for_load_state("networkidle", timeout=5000)
@@ -238,11 +291,27 @@ def scrape_with_playwright(url):
             except Exception as e:
                 logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
 
+            # Wait for potential dynamic content
+            page.wait_for_timeout(2000)
+
             logger.info("📥 Getting page content...")
             html_content = page.content()
             
             # Clean and structure the HTML content
             cleaned_data = clean_html_response(html_content)
+            
+            # If content is still mostly about cookies, try to extract content differently
+            if "cookie" in cleaned_data["content"].lower()[:100]:
+                logger.info("⚠️ Cookie content detected, trying alternative extraction...")
+                try:
+                    # Try to find the main content by waiting for specific elements
+                    page.wait_for_selector('div[class*="property"], div[class*="listing"], div[class*="object"]', timeout=5000)
+                    
+                    # Get updated content
+                    html_content = page.content()
+                    cleaned_data = clean_html_response(html_content)
+                except Exception as e:
+                    logger.warning(f"⚠️ Alternative extraction failed: {str(e)}")
             
             logger.info("✅ Successfully scraped and cleaned content")
             return {
