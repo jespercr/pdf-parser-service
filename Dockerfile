@@ -20,8 +20,7 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . .
 
 # Set Playwright path and install Chromium
-RUN playwright install chromium
-
+RUN playwright install --with-deps
 # Expose port and run
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
