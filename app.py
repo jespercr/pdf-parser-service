@@ -81,11 +81,11 @@ def is_scraping_allowed(url):
     except Exception as e:
         print(f"⚠️ robots.txt check failed: {e}")
         return False
-
+   
 
 def scrape_with_playwright(url):
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = browser.new_page()
         page.goto(url, wait_until="networkidle")
         content = page.content()

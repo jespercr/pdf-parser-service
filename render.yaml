@@ -1,7 +1,6 @@
 services:
   - type: web
     name: pdf-parser-service
-    
     env: docker
     dockerfilePath: ./Dockerfile
     autoDeploy: true
