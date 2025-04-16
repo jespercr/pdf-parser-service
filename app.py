@@ -156,12 +156,15 @@ def clean_html_response(html_content):
     for element in soup(['script', 'style']):
         element.decompose()
     
-    # Remove cookie-related elements
-    for element in soup.find_all(class_=lambda x: x and any(term in str(x).lower() for term in ['cookie', 'consent', 'gdpr'])):
+    # Remove cookie-related elements and terms/conditions
+    for element in soup.find_all(class_=lambda x: x and any(term in str(x).lower() for term in ['cookie', 'consent', 'gdpr', 'terms', 'conditions', 'villkor'])):
         element.decompose()
     
     # Get title
-    title = soup.title.string if soup.title else ""
+    title = ""
+    title_element = soup.find('h1') or soup.title
+    if title_element:
+        title = title_element.get_text(strip=True)
     
     # Get meta description
     meta_desc = ""
@@ -187,21 +190,22 @@ def clean_html_response(html_content):
     for selector in content_selectors:
         elements = soup.find_all(selector['tag'], class_=selector['class_'])
         if elements:
-            # Get the largest content block
-            content_block = max(elements, key=lambda x: len(x.get_text(strip=True)))
-            main_content = content_block.get_text(separator=' ', strip=True)
-            break
+            # Get the largest content block that's not terms/conditions
+            valid_elements = [el for el in elements if not any(term in el.get_text().lower() for term in ['villkor', 'cookie', 'consent', 'gdpr', 'terms', 'conditions'])]
+            if valid_elements:
+                content_block = max(valid_elements, key=lambda x: len(x.get_text(strip=True)))
+                main_content = content_block.get_text(separator=' ', strip=True)
+                break
     
     # If no content found, fall back to paragraphs
     if not main_content:
         paragraphs = soup.find_all('p')
-        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50)  # Only include substantial paragraphs
+        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs 
+                              if len(p.get_text(strip=True)) > 50  # Only include substantial paragraphs
+                              and not any(term in p.get_text().lower() for term in ['villkor', 'cookie', 'consent', 'gdpr', 'terms', 'conditions']))
     
     # Clean up the text
     main_content = re.sub(r'\s+', ' ', main_content).strip()
-    
-    # Remove any remaining cookie-related content
-    main_content = re.sub(r'(?i)(cookie|consent|gdpr).*?(\.|$)', '', main_content)
     
     return {
         "title": title,
@@ -257,18 +261,24 @@ def scrape_with_playwright(url):
             # Handle cookie consent
             logger.info("🍪 Handling cookie consent...")
             try:
+                # Wait for cookie dialog
+                page.wait_for_selector('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]', timeout=5000)
+                
                 # Try different common cookie consent button selectors
                 consent_selectors = [
+                    'button:has-text("Tillåt alla")',
+                    'button:has-text("Acceptera alla")',
+                    'button:has-text("Godkänn alla")',
+                    'button:has-text("Accept all")',
+                    'button:has-text("Allow all")',
+                    '[id*="accept-all"]',
+                    '[class*="accept-all"]',
+                    '[id*="acceptAll"]',
+                    '[class*="acceptAll"]',
                     'button[id*="accept"]',
                     'button[class*="accept"]',
                     'button[id*="consent"]',
-                    'button[class*="consent"]',
-                    'button:has-text("Accept")',
-                    'button:has-text("Accept all")',
-                    'button:has-text("Acceptera")',
-                    'button:has-text("Godkänn")',
-                    'button:has-text("Tillåt")',
-                    'button:has-text("Tillåt alla")'
+                    'button[class*="consent"]'
                 ]
                 
                 for selector in consent_selectors:
@@ -276,13 +286,48 @@ def scrape_with_playwright(url):
                         if page.locator(selector).count() > 0:
                             page.locator(selector).first.click()
                             logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
-                            # Wait for any animations/transitions
-                            page.wait_for_timeout(1000)
+                            # Wait for cookie dialog to disappear
+                            page.wait_for_timeout(2000)
                             break
                     except Exception as e:
                         continue
+                
+                # Ensure cookie banner is gone
+                page.wait_for_selector('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]', state="hidden", timeout=5000)
             except Exception as e:
                 logger.warning(f"⚠️ Cookie consent handling failed, but continuing: {str(e)}")
+            
+            # Wait for the main content to load
+            logger.info("⏳ Waiting for main content...")
+            try:
+                # Wait for specific content elements that indicate the actual listing content
+                content_selectors = [
+                    'div[class*="property-info"]',
+                    'div[class*="estate-info"]',
+                    'div[class*="object-info"]',
+                    'div[class*="listing-details"]',
+                    '#propertyDetails',
+                    '#listingContent',
+                    '.property-description',
+                    '.property-details',
+                    'h1'  # At minimum, wait for the main heading
+                ]
+                
+                # Wait for at least one of these selectors to appear
+                for selector in content_selectors:
+                    try:
+                        element = page.wait_for_selector(selector, timeout=5000)
+                        if element:
+                            logger.info(f"✅ Found content with selector: {selector}")
+                            break
+                    except Exception:
+                        continue
+                
+                # Additional wait for any dynamic content
+                page.wait_for_timeout(2000)
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Waiting for content elements failed: {str(e)}")
             
             try:
                 logger.info("⏳ Waiting for network idle...")
@@ -291,27 +336,36 @@ def scrape_with_playwright(url):
             except Exception as e:
                 logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
 
-            # Wait for potential dynamic content
-            page.wait_for_timeout(2000)
-
+            # Scroll the page to trigger any lazy loading
+            logger.info("📜 Scrolling page for lazy loading...")
+            page.evaluate("""
+                window.scrollTo(0, document.body.scrollHeight);
+                new Promise((resolve) => setTimeout(resolve, 1000));
+                window.scrollTo(0, 0);
+            """)
+            
             logger.info("📥 Getting page content...")
             html_content = page.content()
             
             # Clean and structure the HTML content
             cleaned_data = clean_html_response(html_content)
             
-            # If content is still mostly about cookies, try to extract content differently
-            if "cookie" in cleaned_data["content"].lower()[:100]:
-                logger.info("⚠️ Cookie content detected, trying alternative extraction...")
+            # Verify we got actual content and not terms/cookie page
+            if any(term in cleaned_data["content"].lower() for term in ["villkor", "cookie", "consent", "gdpr", "terms", "conditions"]):
+                logger.warning("⚠️ Got terms/cookie page instead of content, trying alternative extraction...")
                 try:
-                    # Try to find the main content by waiting for specific elements
-                    page.wait_for_selector('div[class*="property"], div[class*="listing"], div[class*="object"]', timeout=5000)
+                    # Try to find the actual content again after a delay
+                    page.wait_for_timeout(2000)
+                    # Refresh the page
+                    page.reload()
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(2000)
                     
                     # Get updated content
                     html_content = page.content()
                     cleaned_data = clean_html_response(html_content)
                 except Exception as e:
-                    logger.warning(f"⚠️ Alternative extraction failed: {str(e)}")
+                    logger.error(f"❌ Alternative extraction failed: {str(e)}")
             
             logger.info("✅ Successfully scraped and cleaned content")
             return {
