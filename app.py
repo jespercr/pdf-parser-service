@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
+from pathlib import Path
 from urllib.parse import urlparse
 import urllib.robotparser
 from utils.robots import is_scraping_allowed
@@ -17,6 +18,8 @@ CORS(app)
 RAILS_BASE_URL = "https://workplacerback.onrender.com" 
  # Replace with your actual domain
 ORIGIN_URL = "https://pdf-parser-service.onrender.com"
+
+PLAYWRIGHT_PATH = "/ms-playwright/chromium-1161/chrome-linux/chrome"
 # ==============
 
 
@@ -85,7 +88,7 @@ def is_scraping_allowed(url):
 
 def scrape_with_playwright(url):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"], executable_path=PLAYWRIGHT_PATH)
         page = browser.new_page()
         page.goto(url, wait_until="networkidle")
         content = page.content()
