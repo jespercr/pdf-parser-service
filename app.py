@@ -19,7 +19,11 @@ RAILS_BASE_URL = "https://workplacerback.onrender.com"
  # Replace with your actual domain
 ORIGIN_URL = "https://pdf-parser-service.onrender.com"
 
-PLAYWRIGHT_PATH = "/ms-playwright/chromium-1161/chrome-linux/chrome"
+# Check both potential Chromium locations
+PLAYWRIGHT_PATHS = [
+    "/ms-playwright/chromium-1161/chrome-linux/chrome",  # Render's possible location
+    str(Path.home() / ".cache/ms-playwright/chromium-1161/chrome-linux/chrome"),  # Local dev location
+]
 # ==============
 
 
@@ -86,8 +90,20 @@ def is_scraping_allowed(url):
         return False
    
 def find_chromium_executable():
+    # First check our predefined paths
+    for path in PLAYWRIGHT_PATHS:
+        if os.path.exists(path):
+            print(f"✅ Chromium executable found at predefined path: {path}")
+            return path
+
+    # Fallback to searching in the cache directory
     base = Path.home() / ".cache/ms-playwright"
     print("🗂 Checking Chromium install path:", base)
+
+    if not base.exists():
+        print("⚠️ Base playwright directory not found")
+        # Try to install playwright browsers
+        os.system("playwright install chromium")
 
     folders = list(base.glob("chromium-*"))
     print("📁 Chromium folders found:", folders)
@@ -98,8 +114,8 @@ def find_chromium_executable():
             print("✅ Chromium executable found at:", executable)
             return str(executable)
 
-    print("❌ Chromium executable not found in expected location.")
-    raise FileNotFoundError("Chromium executable not found")
+    print("❌ Chromium executable not found in any location")
+    raise FileNotFoundError("Chromium executable not found. Please ensure Playwright browsers are installed.")
 
 def scrape_with_playwright(url):
     executable_path = find_chromium_executable()
