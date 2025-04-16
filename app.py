@@ -41,9 +41,9 @@ PLAYWRIGHT_PATHS = [
 ]
 
 # Scraping configs
-PAGE_TIMEOUT = 20000  # 20 seconds
-NAVIGATION_TIMEOUT = 15000  # 15 seconds
-CONTENT_WAIT_TIMEOUT = 5000  # 5 seconds
+PAGE_TIMEOUT = 15000  # 15 seconds
+NAVIGATION_TIMEOUT = 10000  # 10 seconds
+MAX_SCRAPE_TIME = 10  # 10 seconds total max time
 # ==============
 
 @app.before_request
@@ -146,6 +146,102 @@ def find_chromium_executable():
     print("❌ Chromium executable not found in any location")
     raise FileNotFoundError("Chromium executable not found. Please ensure Playwright browsers are installed.")
 
+def scrape_with_playwright(url):
+    """
+    Simple, direct scraping function that avoids timeouts by limiting steps and operations.
+    """
+    logger.info(f"🚀 Starting scrape for URL: {url}")
+    executable_path = find_chromium_executable()
+    logger.info(f"🎭 Using Chromium at: {executable_path}")
+    
+    start_time = datetime.now()
+    browser = None
+    
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                executable_path=executable_path
+            )
+            
+            # Create minimal browser context
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            )
+            
+            # Create page with minimal timeouts
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT)
+            page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+
+            # Navigate to page with shortest path to content
+            logger.info(f"🌐 Navigating to URL: {url}")
+            response = page.goto(url, wait_until="domcontentloaded")
+            
+            if not response or response.status >= 400:
+                logger.error(f"❌ Page error: {response.status if response else 'No response'}")
+                raise Exception(f"Failed to load page: {response.status if response else 'No response'}")
+            
+            # Simple cookie handling - only try to click most common buttons once
+            try:
+                selectors = [
+                    'button:has-text("Accept")', 
+                    'button:has-text("Acceptera")',
+                    'button:has-text("Godkänn")',
+                    'button:has-text("Tillåt")'
+                ]
+                
+                for selector in selectors:
+                    if page.locator(selector).count() > 0:
+                        page.locator(selector).first.click(timeout=2000)
+                        logger.info(f"✅ Clicked cookie button: {selector}")
+                        break
+            except Exception as e:
+                logger.info(f"ℹ️ No cookie dialog or failed to handle: {str(e)}")
+            
+            # Wait 1 second for any content to load
+            page.wait_for_timeout(1000)
+            
+            # Simple scroll to trigger lazy loading
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+            
+            # Immediately capture HTML content
+            logger.info("📥 Getting page content...")
+            html_content = page.content()
+            
+            # Clean and extract
+            cleaned_data = clean_html_response(html_content)
+            
+            # Close browser to free resources
+            browser.close()
+            browser = None
+            
+            # Report timing
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f"✅ Scraping completed in {elapsed:.2f} seconds")
+            
+            return {
+                "success": True,
+                "data": cleaned_data
+            }
+    
+    except Exception as e:
+        elapsed = (datetime.now() - start_time).total_seconds()
+        logger.error(f"🚨 Scraping error after {elapsed:.2f} seconds: {str(e)}")
+        logger.error(f"Stack trace: {traceback.format_exc()}")
+        raise Exception(f"Failed to scrape URL: {str(e)}")
+        
+    finally:
+        # Ensure browser is closed
+        if browser:
+            try:
+                browser.close()
+                logger.info("🎭 Browser closed")
+            except Exception:
+                logger.error("Failed to close browser")
+
 def clean_html_response(html_content):
     """
     Clean and structure HTML content using BeautifulSoup.
@@ -153,19 +249,17 @@ def clean_html_response(html_content):
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Remove script, style elements and cookie-related content
+    # Remove script and style elements
     for element in soup(['script', 'style']):
         element.decompose()
     
-    # Remove cookie-related elements and terms/conditions
-    for element in soup.find_all(class_=lambda x: x and any(term in str(x).lower() for term in ['cookie', 'consent', 'gdpr', 'terms', 'conditions', 'villkor'])):
-        element.decompose()
-    
-    # Get title
+    # Get title - prefer h1 over title tag
     title = ""
-    title_element = soup.find('h1') or soup.title
-    if title_element:
-        title = title_element.get_text(strip=True)
+    h1 = soup.find('h1')
+    if h1:
+        title = h1.get_text(strip=True)
+    elif soup.title:
+        title = soup.title.string
     
     # Get meta description
     meta_desc = ""
@@ -173,226 +267,49 @@ def clean_html_response(html_content):
     if meta_tag and meta_tag.get('content'):
         meta_desc = meta_tag['content']
     
-    # Try to find main content with more specific selectors
-    main_content = ""
+    # Extract main content - use targeted approach for property listings
+    content_text = ""
     
-    # Priority list of content selectors
-    content_selectors = [
-        # Property specific selectors
-        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['property-info', 'property-details', 'property-description'])},
-        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['listing-details', 'listing-description'])},
-        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['object-info', 'object-details'])},
-        # Generic content selectors
-        {'tag': ['article', 'main'], 'class_': None},
-        {'tag': 'div', 'class_': lambda x: x and any(term in str(x).lower() for term in ['content', 'article', 'main'])}
-    ]
+    # Try to find property-specific elements
+    property_classes = ['property-info', 'property-details', 'listing-details', 'object-info']
+    property_content = None
     
-    # Try each selector in order
-    for selector in content_selectors:
-        elements = soup.find_all(selector['tag'], class_=selector['class_'])
+    for cls in property_classes:
+        elements = soup.find_all(class_=lambda x: x and cls.lower() in x.lower())
         if elements:
-            # Get the largest content block that's not terms/conditions
-            valid_elements = [el for el in elements if not any(term in el.get_text().lower() for term in ['villkor', 'cookie', 'consent', 'gdpr', 'terms', 'conditions'])]
-            if valid_elements:
-                content_block = max(valid_elements, key=lambda x: len(x.get_text(strip=True)))
-                main_content = content_block.get_text(separator=' ', strip=True)
+            property_content = elements[0]
+            break
+    
+    if property_content:
+        # We found property content, use it
+        content_text = property_content.get_text(separator=' ', strip=True)
+    else:
+        # Fallback: collect all paragraphs that are substantial
+        paragraphs = []
+        for p in soup.find_all('p'):
+            text = p.get_text(strip=True)
+            if len(text) > 30 and not any(term in text.lower() for term in ['cookie', 'consent', 'gdpr', 'villkor']):
+                paragraphs.append(text)
+        
+        content_text = ' '.join(paragraphs)
+    
+    # If content is too small, try an alternative approach
+    if len(content_text) < 100:
+        # Get all divs with substantial text
+        for div in soup.find_all('div'):
+            text = div.get_text(strip=True)
+            if len(text) > 200 and not any(term in text.lower() for term in ['cookie', 'consent', 'gdpr', 'villkor']):
+                content_text = text
                 break
     
-    # If no content found, fall back to paragraphs
-    if not main_content:
-        paragraphs = soup.find_all('p')
-        main_content = ' '.join(p.get_text(strip=True) for p in paragraphs 
-                              if len(p.get_text(strip=True)) > 50  # Only include substantial paragraphs
-                              and not any(term in p.get_text().lower() for term in ['villkor', 'cookie', 'consent', 'gdpr', 'terms', 'conditions']))
-    
-    # Clean up the text
-    main_content = re.sub(r'\s+', ' ', main_content).strip()
+    # Final cleaning
+    content_text = re.sub(r'\s+', ' ', content_text).strip()
     
     return {
         "title": title,
         "description": meta_desc,
-        "content": main_content
+        "content": content_text
     }
-
-def scrape_with_playwright(url):
-    logger.info(f"🚀 Starting scrape for URL: {url}")
-    executable_path = find_chromium_executable()
-    logger.info(f"🎭 Using Chromium at: {executable_path}")
-    
-    with sync_playwright() as p:
-        try:
-            logger.info("📱 Launching browser...")
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-                executable_path=executable_path
-            )
-            
-            logger.info("🌍 Creating browser context...")
-            context = browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            )
-            
-            logger.info("📄 Creating new page...")
-            page = context.new_page()
-            page.set_default_timeout(PAGE_TIMEOUT)
-            page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
-
-            logger.info(f"🌐 Navigating to URL: {url}")
-            response = page.goto(url, wait_until="domcontentloaded")
-            
-            if not response:
-                logger.error("❌ Failed to get response from page")
-                raise Exception("Failed to get response from page")
-            
-            logger.info(f"📡 Response status: {response.status}")
-            if response.status >= 400:
-                logger.error(f"❌ Page returned error status code: {response.status}")
-                raise Exception(f"Page returned status code: {response.status}")
-            
-            # Handle cookie consent only if dialog is present
-            logger.info("🍪 Checking for cookie consent dialog...")
-            try:
-                # Quick check if cookie dialog exists
-                has_cookie_dialog = page.locator('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]').count() > 0
-                
-                if has_cookie_dialog:
-                    logger.info("🍪 Cookie dialog found, handling consent...")
-                    # Try different common cookie consent button selectors
-                    consent_selectors = [
-                        'button:has-text("Tillåt alla")',
-                        'button:has-text("Acceptera alla")',
-                        'button:has-text("Godkänn alla")',
-                        'button:has-text("Accept all")',
-                        'button:has-text("Allow all")',
-                        '[id*="accept-all"]',
-                        '[class*="accept-all"]',
-                        '[id*="acceptAll"]',
-                        '[class*="acceptAll"]',
-                        'button[id*="accept"]',
-                        'button[class*="accept"]',
-                        'button[id*="consent"]',
-                        'button[class*="consent"]'
-                    ]
-                    
-                    for selector in consent_selectors:
-                        try:
-                            if page.locator(selector).count() > 0:
-                                page.locator(selector).first.click()
-                                logger.info(f"✅ Clicked cookie consent button with selector: {selector}")
-                                # Short wait for cookie dialog to disappear
-                                page.wait_for_timeout(1000)
-                                break
-                        except Exception as e:
-                            continue
-                    
-                    # Quick verify cookie banner is gone
-                    if page.locator('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"]').count() > 0:
-                        logger.warning("⚠️ Cookie dialog might still be present")
-                else:
-                    logger.info("✅ No cookie dialog found, proceeding with content extraction")
-            except Exception as e:
-                logger.warning(f"⚠️ Cookie consent check failed, but continuing: {str(e)}")
-            
-            # Wait for the main content to load with a shorter timeout
-            logger.info("⏳ Waiting for main content...")
-            content_found = False
-            try:
-                # Wait for specific content elements that indicate the actual listing content
-                content_selectors = [
-                    'div[class*="property-info"]',
-                    'div[class*="estate-info"]',
-                    'div[class*="object-info"]',
-                    'div[class*="listing-details"]',
-                    '#propertyDetails',
-                    '#listingContent',
-                    '.property-description',
-                    '.property-details',
-                    'h1'  # At minimum, wait for the main heading
-                ]
-                
-                # Try to find any content element with a short timeout
-                for selector in content_selectors:
-                    try:
-                        element = page.wait_for_selector(selector, timeout=CONTENT_WAIT_TIMEOUT)
-                        if element:
-                            logger.info(f"✅ Found content with selector: {selector}")
-                            content_found = True
-                            break
-                    except Exception:
-                        continue
-                
-                if not content_found:
-                    logger.warning("⚠️ No specific content elements found, proceeding with general content")
-                
-            except Exception as e:
-                logger.warning(f"⚠️ Waiting for content elements failed: {str(e)}")
-            
-            # Quick network idle check
-            try:
-                page.wait_for_load_state("networkidle", timeout=3000)
-                logger.info("✅ Network is idle")
-            except Exception as e:
-                logger.warning(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
-
-            # Quick scroll for lazy loading
-            logger.info("📜 Quick scroll for lazy loading...")
-            page.evaluate("""
-                window.scrollTo(0, document.body.scrollHeight/2);
-                setTimeout(() => window.scrollTo(0, 0), 500);
-            """)
-            
-            # Short wait for any final content
-            page.wait_for_timeout(1000)
-            
-            logger.info("📥 Getting page content...")
-            html_content = page.content()
-            
-            # Clean and structure the HTML content
-            cleaned_data = clean_html_response(html_content)
-            
-            # Quick verify we got actual content and not terms/cookie page
-            if any(term in cleaned_data["content"].lower()[:200] for term in ["villkor", "cookie", "consent", "gdpr", "terms", "conditions"]):
-                logger.warning("⚠️ Got terms/cookie page instead of content, trying alternative extraction...")
-                try:
-                    # Quick retry with a refresh
-                    page.reload(wait_until="domcontentloaded")
-                    page.wait_for_timeout(1000)
-                    
-                    # Get updated content
-                    html_content = page.content()
-                    cleaned_data = clean_html_response(html_content)
-                except Exception as e:
-                    logger.error(f"❌ Alternative extraction failed: {str(e)}")
-            
-            logger.info("✅ Successfully scraped and cleaned content")
-            return {
-                "success": True,
-                "data": cleaned_data
-            }
-
-        except Exception as e:
-            logger.error(f"🚨 Scraping error: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            if 'browser' in locals():
-                try:
-                    browser.close()
-                    logger.info("🎭 Browser closed after error")
-                except:
-                    logger.error("Failed to close browser after error")
-            raise Exception(f"Failed to scrape URL: {str(e)}")
-        finally:
-            if 'browser' in locals():
-                try:
-                    browser.close()
-                    logger.info("🎭 Browser closed")
-                except:
-                    logger.error("Failed to close browser")
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
