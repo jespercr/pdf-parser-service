@@ -24,6 +24,10 @@ PLAYWRIGHT_PATHS = [
     "/ms-playwright/chromium-1161/chrome-linux/chrome",  # Render's possible location
     str(Path.home() / ".cache/ms-playwright/chromium-1161/chrome-linux/chrome"),  # Local dev location
 ]
+
+# Scraping configs
+PAGE_TIMEOUT = 60000  # 60 seconds
+NAVIGATION_TIMEOUT = 30000  # 30 seconds
 # ==============
 
 
@@ -120,12 +124,57 @@ def find_chromium_executable():
 def scrape_with_playwright(url):
     executable_path = find_chromium_executable()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"], executable_path=executable_path)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
-        content = page.content()
-        browser.close()
-        return content
+        try:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",  # Disable /dev/shm usage
+                    "--disable-gpu",  # Disable GPU hardware acceleration
+                ],
+                executable_path=executable_path
+            )
+            
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            )
+            
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT)
+            page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
+
+            print(f"🌐 Navigating to URL: {url}")
+            response = page.goto(url)
+            
+            if not response:
+                raise Exception("Failed to get response from page")
+            
+            if response.status >= 400:
+                raise Exception(f"Page returned status code: {response.status}")
+
+            # Wait for either networkidle or load event, whichever comes first
+            print("⏳ Waiting for page to load...")
+            page.wait_for_load_state("domcontentloaded")
+            
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)  # Short timeout for networkidle
+            except Exception as e:
+                print(f"⚠️ Network didn't become idle, but continuing: {str(e)}")
+
+            print("📄 Getting page content...")
+            content = page.content()
+            
+            context.close()
+            browser.close()
+            
+            return content
+            
+        except Exception as e:
+            print(f"🚨 Scraping error: {str(e)}")
+            if 'browser' in locals():
+                browser.close()
+            raise Exception(f"Failed to scrape URL: {str(e)}")
 
 
 
