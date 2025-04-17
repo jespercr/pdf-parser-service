@@ -16,7 +16,7 @@ CORS(app)
 # === CONFIG ===
 RAILS_BASE_URL = "https://workplacerback.onrender.com" 
  # Replace with your actual domain
-ORIGIN_URL = "https://pdf-parser-service.onrender.com"
+ORIGIN_URL = "https://workplacer-parser.onrender.com"
 # ==============
 
 
