@@ -15,6 +15,8 @@ import traceback
 from datetime import datetime
 from bs4 import BeautifulSoup
 import re
+import time
+from contextlib import timeout
 
 # Configure logging
 logging.basicConfig(
@@ -57,38 +59,126 @@ def log_request_info():
     logger.info("==================")
 
 def parse_pdf_text(pdf_path):
-    text = ""
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-            text += "\n\n"
-    return text.strip()
+    """
+    Parse PDF text with optimized memory usage and timeout protection
+    """
+    text = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            # Process in chunks of 10 pages
+            for i in range(0, total_pages, 10):
+                chunk = pdf.pages[i:i+10]
+                for page in chunk:
+                    try:
+                        # Add timeout protection for each page
+                        with timeout(seconds=30):
+                            page_text = page.extract_text() or ""
+                            text.append(page_text)
+                    except TimeoutError:
+                        logger.warning(f"Timeout extracting text from page {i}")
+                        text.append(f"[Error: Timeout processing page {i}]")
+                    except Exception as e:
+                        logger.error(f"Error processing page {i}: {str(e)}")
+                        text.append(f"[Error processing page {i}]")
+                
+                # Clear memory after each chunk
+                del chunk
+                import gc
+                gc.collect()
+                
+    except Exception as e:
+        logger.error(f"Error parsing PDF: {str(e)}")
+        raise
+        
+    return "\n\n".join(text).strip()
 
+class timeout:
+    """
+    Timeout context manager to prevent hanging on PDF processing
+    """
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __enter__(self):
+        def signal_handler(signum, frame):
+            raise TimeoutError("Timed out")
+        
+        import signal
+        signal.signal(signal.SIGALRM, signal_handler)
+        signal.alarm(self.seconds)
+
+    def __exit__(self, type, value, traceback):
+        import signal
+        signal.alarm(0)
 
 def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
+    """
+    Extract images with optimized memory usage and timeout protection
+    """
     os.makedirs(output_dir, exist_ok=True)
-    doc = fitz.open(pdf_path)
     image_paths = []
-
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        images = page.get_images(full=True)
-
-        for i, img in enumerate(images):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            ext = base_image["ext"]
-            img_filename = f"page{page_num+1}_img{i+1}.{ext}"
-            img_path = os.path.join(output_dir, img_filename)
-
-            with open(img_path, "wb") as f:
-                f.write(image_bytes)
-
-            image_paths.append(img_path)
-
+    
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        
+        # Process in chunks of 5 pages
+        for start_page in range(0, total_pages, 5):
+            try:
+                with timeout(seconds=30):  # 30 second timeout per chunk
+                    end_page = min(start_page + 5, total_pages)
+                    for page_num in range(start_page, end_page):
+                        page = doc[page_num]
+                        images = page.get_images(full=True)
+                        
+                        for i, img in enumerate(images):
+                            try:
+                                xref = img[0]
+                                base_image = doc.extract_image(xref)
+                                image_bytes = base_image["image"]
+                                ext = base_image["ext"]
+                                
+                                # Skip if image is too large (e.g., > 10MB)
+                                if len(image_bytes) > 10 * 1024 * 1024:
+                                    logger.warning(f"Skipping large image on page {page_num}")
+                                    continue
+                                    
+                                img_filename = f"page{page_num+1}_img{i+1}.{ext}"
+                                img_path = os.path.join(output_dir, img_filename)
+                                
+                                with open(img_path, "wb") as f:
+                                    f.write(image_bytes)
+                                
+                                image_paths.append(img_path)
+                                
+                                # Clear memory
+                                del image_bytes
+                                del base_image
+                                
+                            except Exception as e:
+                                logger.error(f"Error extracting image {i} from page {page_num}: {str(e)}")
+                                continue
+                        
+                        # Clear page from memory
+                        page = None
+                        
+                # Force garbage collection after each chunk
+                import gc
+                gc.collect()
+                        
+            except TimeoutError:
+                logger.warning(f"Timeout processing pages {start_page}-{end_page}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Error in image extraction: {str(e)}")
+        raise
+    finally:
+        if 'doc' in locals():
+            doc.close()
+            
     return image_paths
-
 
 def send_images_to_rails(image_paths, space_id):
     url = f"{RAILS_BASE_URL}/api/v1/spaces/{space_id}/addimages"
@@ -146,101 +236,188 @@ def find_chromium_executable():
     print("❌ Chromium executable not found in any location")
     raise FileNotFoundError("Chromium executable not found. Please ensure Playwright browsers are installed.")
 
-def scrape_with_playwright(url):
+async def scrape_with_playwright(url):
     """
-    Simple, direct scraping function that avoids timeouts by limiting steps and operations.
+    Scrape a website using Playwright.
+    This version includes better cookie consent handling and content loading detection.
     """
-    logger.info(f"🚀 Starting scrape for URL: {url}")
-    executable_path = find_chromium_executable()
-    logger.info(f"🎭 Using Chromium at: {executable_path}")
+    logger.info(f"🌐 Scraping URL: {url}")
+    start_time = time.time()
     
-    start_time = datetime.now()
     browser = None
-    
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-                executable_path=executable_path
-            )
+        chromium_path = find_chromium_executable()
+        logger.info(f"🔍 Using Chromium at {chromium_path}")
+        
+        # Launch browser with custom settings
+        browser = await playwright.chromium.launch(
+            executable_path=chromium_path if chromium_path else None,
+            headless=True
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        
+        # Add storage state for persistence if needed
+        await context.add_cookies([{
+            "name": "cookieConsent", 
+            "value": "true", 
+            "domain": "."+".".join(url.split('/')[2].split('.')[-2:]),
+            "path": "/"
+        }])
+        
+        page = await context.new_page()
+        
+        # Set long timeout for navigation
+        await page.set_default_timeout(30000)
+        
+        logger.info(f"⌛ Navigating to URL...")
+        response = await page.goto(url)
+        
+        # Check response status
+        if not response:
+            logger.error("❌ Failed to get response from page")
+            return {"error": "No response from page"}
+        
+        status = response.status
+        logger.info(f"🔢 Response status: {status}")
+        
+        if status >= 400:
+            logger.error(f"❌ Error status code: {status}")
+            return {"error": f"HTTP error: {status}"}
+        
+        # Wait for network to be idle
+        await page.wait_for_load_state("networkidle")
+        logger.info("🛑 Network is idle")
+        
+        # Handle cookie consent - try multiple common selectors
+        consent_buttons = [
+            # General accept buttons
+            'button[id*="accept"]', 'button[class*="accept"]', 
+            'button:has-text("Accept")', 'button:has-text("Accept all")',
+            'button:has-text("Godkänn")', 'button:has-text("Acceptera")',
+            'a[id*="accept"]', 'a[class*="accept"]',
+            'a:has-text("Accept")', 'a:has-text("Accept all")',
             
-            # Create minimal browser context
-            context = browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            )
+            # Common cookie consent button IDs/classes
+            '#onetrust-accept-btn-handler', '.cookie-accept-button',
+            '#accept-all-cookies', '.accept-cookies-button',
+            '#accept-cookies', '.cookie-accept',
+            '#acceptCookies', '#CybotCookiebotDialogBodyButtonAccept',
+            '#gdpr-cookie-accept', '#cookie-notice-accept-button',
             
-            # Create page with minimal timeouts
-            page = context.new_page()
-            page.set_default_timeout(PAGE_TIMEOUT)
-            page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
-
-            # Navigate to page with shortest path to content
-            logger.info(f"🌐 Navigating to URL: {url}")
-            response = page.goto(url, wait_until="domcontentloaded")
-            
-            if not response or response.status >= 400:
-                logger.error(f"❌ Page error: {response.status if response else 'No response'}")
-                raise Exception(f"Failed to load page: {response.status if response else 'No response'}")
-            
-            # Simple cookie handling - only try to click most common buttons once
+            # Common consent interfaces
+            '[aria-label="Accept cookies"]', '[data-testid="cookie-accept"]',
+            '[data-action="accept-cookies"]', '[data-action="accept-all"]'
+        ]
+        
+        # Try to accept cookies
+        for selector in consent_buttons:
             try:
-                selectors = [
-                    'button:has-text("Accept")', 
-                    'button:has-text("Acceptera")',
-                    'button:has-text("Godkänn")',
-                    'button:has-text("Tillåt")'
-                ]
-                
-                for selector in selectors:
-                    if page.locator(selector).count() > 0:
-                        page.locator(selector).first.click(timeout=2000)
-                        logger.info(f"✅ Clicked cookie button: {selector}")
-                        break
+                logger.info(f"🍪 Looking for consent button: {selector}")
+                if await page.locator(selector).count() > 0:
+                    await page.locator(selector).click(timeout=2000)
+                    logger.info(f"🍪 Clicked consent button: {selector}")
+                    # Wait for potential overlay to disappear
+                    await page.wait_for_timeout(1000)
+                    break
             except Exception as e:
-                logger.info(f"ℹ️ No cookie dialog or failed to handle: {str(e)}")
+                # Just log and continue to next selector
+                logger.debug(f"Couldn't click {selector}: {str(e)}")
+                continue
+        
+        # Wait a bit for page to settle after cookie interactions
+        await page.wait_for_timeout(1000)
+        
+        # Wait for content to stabilize by checking for DOM size changes
+        previous_content_size = 0
+        stable_count = 0
+        max_stabilize_checks = 5
+        
+        for i in range(max_stabilize_checks):
+            # Get the current content size
+            content_size = await page.evaluate('''() => {
+                return document.body.innerHTML.length;
+            }''')
             
-            # Wait 1 second for any content to load
-            page.wait_for_timeout(1000)
+            logger.debug(f"Content size check {i+1}: {content_size} bytes")
             
-            # Simple scroll to trigger lazy loading
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
+            # If content size is stable, increment counter
+            if abs(content_size - previous_content_size) < 100:
+                stable_count += 1
+                if stable_count >= 2:  # Content is considered stable after 2 consecutive stable checks
+                    logger.info(f"✅ Content appears stable after {i+1} checks")
+                    break
+            else:
+                stable_count = 0
+                
+            previous_content_size = content_size
+            await page.wait_for_timeout(1000)  # Wait a second between checks
+        
+        # Try scrolling to load any lazy content
+        await page.evaluate('''() => {
+            window.scrollTo(0, document.body.scrollHeight / 2);
+            setTimeout(() => { window.scrollTo(0, document.body.scrollHeight); }, 500);
+        }''')
+        await page.wait_for_timeout(1500)  # Wait for lazy loading to complete
+        
+        # Get HTML content after all interactions
+        html_content = await page.content()
+        logger.info(f"📄 Got HTML content: {len(html_content)} bytes")
+        
+        # Clean the HTML response
+        cleaned_data = clean_html_response(html_content)
+        
+        # Check if cleaned content is mostly about cookies/consent
+        content_text = cleaned_data.get("content", "")
+        if content_text and len(content_text) < 200 or "cookie" in content_text.lower()[:100]:
+            logger.warning("⚠️ Initial content appears to be cookie-related. Trying alternative extraction...")
             
-            # Immediately capture HTML content
-            logger.info("📥 Getting page content...")
-            html_content = page.content()
+            # Take a screenshot for debugging if content is cookie-related
+            await page.screenshot(path="/tmp/cookie_page.png")
+            logger.info("📸 Saved screenshot to /tmp/cookie_page.png")
             
-            # Clean and extract
-            cleaned_data = clean_html_response(html_content)
+            # Try to extract content directly from page
+            extracted_content = await page.evaluate('''() => {
+                // Remove cookie-related content
+                const cookieElements = document.querySelectorAll('[id*="cookie"], [class*="cookie"], [id*="consent"], [class*="consent"], [id*="gdpr"], [class*="gdpr"]');
+                cookieElements.forEach(el => el.remove());
+                
+                // Try to get main content
+                const mainContent = document.querySelector('main') || document.querySelector('article');
+                if (mainContent) return mainContent.innerText;
+                
+                // Fallback to paragraphs
+                const paragraphs = Array.from(document.querySelectorAll('p')).map(p => p.innerText).filter(text => text.length > 50);
+                return paragraphs.join('\n\n');
+            }''')
             
-            # Close browser to free resources
-            browser.close()
-            browser = None
-            
-            # Report timing
-            elapsed = (datetime.now() - start_time).total_seconds()
-            logger.info(f"✅ Scraping completed in {elapsed:.2f} seconds")
-            
-            return {
-                "success": True,
-                "data": cleaned_data
-            }
-    
+            if extracted_content and len(extracted_content) > 200:
+                logger.info(f"🔄 Alternative extraction successful: {len(extracted_content)} characters")
+                cleaned_data["content"] = extracted_content
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ Scraping completed in {elapsed_time:.2f} seconds")
+        
+        # Add scraping metadata
+        cleaned_data["metadata"] = {
+            "scrape_time": elapsed_time,
+            "url": url,
+            "status_code": status,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        return cleaned_data
+        
     except Exception as e:
-        elapsed = (datetime.now() - start_time).total_seconds()
-        logger.error(f"🚨 Scraping error after {elapsed:.2f} seconds: {str(e)}")
-        logger.error(f"Stack trace: {traceback.format_exc()}")
-        raise Exception(f"Failed to scrape URL: {str(e)}")
+        logger.error(f"❌ Error during scraping: {str(e)}")
+        return {"error": str(e)}
         
     finally:
-        # Ensure browser is closed
         if browser:
-            try:
-                browser.close()
-                logger.info("🎭 Browser closed")
-            except Exception:
-                logger.error("Failed to close browser")
+            logger.info(" Closing browser")
+            await browser.close()
 
 def clean_html_response(html_content):
     """
@@ -250,15 +427,36 @@ def clean_html_response(html_content):
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # Remove script, style, and footer elements
-    for element in soup(['script', 'style', 'footer', 'iframe']):
+    for element in soup(['script', 'style', 'footer', 'iframe', 'header', 'nav']):
         element.decompose()
         
     # Remove all elements containing policy-related content
     policy_terms = ['cookie', 'gdpr', 'privacy', 'policy', 'villkor', 'consent', 'personuppgift', 
-                   'integritet', 'acceptera', 'godkänn', 'samtycke', 'rättigheter']
+                   'integritet', 'acceptera', 'godkänn', 'samtycke', 'rättigheter',
+                   'accept', 'allow', 'datapolicy', 'dataskydd']
                    
+    # Remove common non-content elements by ID, class, and role
+    non_content_selectors = [
+        '[id*="cookie"]', '[class*="cookie"]', '[id*="consent"]', '[class*="consent"]',
+        '[id*="gdpr"]', '[class*="gdpr"]', '[id*="privacy"]', '[class*="privacy"]',
+        '[id*="popup"]', '[class*="popup"]', '[id*="modal"]', '[class*="modal"]',
+        '[id*="banner"]', '[class*="banner"]', '[id*="alert"]', '[class*="alert"]',
+        '[id*="dialog"]', '[class*="dialog"]', '[id*="notice"]', '[class*="notice"]',
+        '[id*="overlay"]', '[class*="overlay"]', '[id*="notification"]', '[class*="notification"]',
+        '[id*="menu"]', '[class*="menu"]', '[id*="nav"]', '[class*="nav"]',
+        '[id*="header"]', '[class*="header"]', '[id*="footer"]', '[class*="footer"]',
+        '[id*="sidebar"]', '[class*="sidebar"]', '[id*="aside"]', '[class*="aside"]',
+        '[role="banner"]', '[role="navigation"]', '[role="complementary"]', '[role="contentinfo"]',
+        '[aria-label*="cookie"]', '[aria-labelledby*="cookie"]',
+        '[data-testid*="cookie"]', '[data-id*="cookie"]'
+    ]
+    
+    for selector in non_content_selectors:
+        for element in soup.select(selector):
+            element.decompose()
+    
     # First pass: remove elements with policy terms in their attributes
-    for element in soup.find_all(lambda tag: any(term in (tag.get('id', '') + tag.get('class', '') + tag.get('title', '')).lower() for term in policy_terms)):
+    for element in soup.find_all(lambda tag: any(term in (str(tag.get('id', '')) + str(tag.get('class', '')) + str(tag.get('title', ''))).lower() for term in policy_terms)):
         element.decompose()
     
     # Second pass: remove elements with policy terms in their text
@@ -287,7 +485,8 @@ def clean_html_response(html_content):
     # Strategy 1: Look for property-specific containers
     property_classes = [
         'property-info', 'property-details', 'listing-details', 'object-info',
-        'property-description', 'estate-info', 'listing-description'
+        'property-description', 'estate-info', 'listing-description', 'main-content',
+        'content-main', 'article', 'main', 'content-area', 'page-content'
     ]
     
     # Try each class separately to find meaningful content
@@ -301,6 +500,19 @@ def clean_html_response(html_content):
                     break
             if content_text:
                 break
+    
+    # Try finding by semantic HTML elements if no property-specific class found
+    if not content_text:
+        for tag in ['main', 'article']:
+            elements = soup.find_all(tag)
+            if elements:
+                for element in elements:
+                    text = element.get_text(separator=' ', strip=True)
+                    if len(text) > 100 and not any(term in text.lower() for term in policy_terms):
+                        content_text = text
+                        break
+                if content_text:
+                    break
     
     # Strategy 2: If no property container found, look for specific sections
     if not content_text:
@@ -358,73 +570,128 @@ def clean_html_response(html_content):
         "content": content_text
     }
 
-@app.route("/scrape", methods=["POST"])
+@app.route('/scrape', methods=['POST'])
 def scrape():
-    request_start_time = datetime.now()
-    logger.info(f"📨 Received scrape request at {request_start_time}")
+    """
+    Endpoint for scraping a website and extracting content
+    """
+    start_time = time.time()
+    logger.info("📥 Received scrape request")
+
+    # Check request format
+    if not request.is_json:
+        logger.error("❌ Request is not JSON")
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    # Parse request
+    req_data = request.get_json()
     
+    # Check for URL
+    if 'url' not in req_data:
+        logger.error("❌ No URL provided")
+        return jsonify({"error": "URL is required"}), 400
+    
+    url = req_data['url']
+    
+    # Check if scraping is allowed
     try:
-        if not request.is_json:
-            logger.error("❌ Request is not JSON")
-            return jsonify({"error": "Content-Type must be application/json"}), 400
-            
-        data = request.get_json()
-        logger.info(f"📝 Request data: {data}")
-        
-        url = data.get("url")
-        if not url:
-            logger.error("❌ No URL provided in request")
-            return jsonify({"error": "No URL provided"}), 400
-
-        logger.info(f"🔍 Checking if scraping is allowed for: {url}")
         if not is_scraping_allowed(url):
-            logger.error("🚫 Scraping disallowed by robots.txt")
-            return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
-
-        logger.info("🤖 Starting scraping process...")
-        try:
-            scraped_data = scrape_with_playwright(url)
-            request_duration = (datetime.now() - request_start_time).total_seconds()
-            logger.info(f"✅ Scraping completed successfully in {request_duration} seconds")
-            
-            return jsonify(scraped_data)
-            
-        except Exception as e:
-            logger.error(f"🚨 Scraping error: {str(e)}")
-            logger.error(f"Stack trace: {traceback.format_exc()}")
-            return jsonify({"error": str(e)}), 500
-            
+            logger.error(f"🚫 Scraping not allowed for {url}")
+            return jsonify({"error": "Scraping not allowed by robots.txt"}), 403
     except Exception as e:
-        error_msg = f"🚨 Request processing failed: {str(e)}\n{traceback.format_exc()}"
-        logger.error(error_msg)
+        logger.warning(f"⚠️ Error checking robots.txt: {str(e)}")
+    
+    # Run the scraping in a synchronous wrapper around the async function
+    try:
+        import asyncio
+        # Check if we're already in an event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Create a new loop for this request
+                new_loop = asyncio.new_event_loop()
+                result = new_loop.run_until_complete(scrape_with_playwright(url))
+                new_loop.close()
+            else:
+                result = loop.run_until_complete(scrape_with_playwright(url))
+        except RuntimeError:
+            # No event loop exists yet
+            result = asyncio.run(scrape_with_playwright(url))
+            
+        elapsed_time = time.time() - start_time
+        logger.info(f"⏱️ Total request time: {elapsed_time:.2f} seconds")
+        
+        # Add request timing to response
+        if isinstance(result, dict) and "metadata" in result:
+            result["metadata"]["total_request_time"] = elapsed_time
+        
+        return jsonify(result)
+    
+    except Exception as e:
+        logger.error(f"🚨 Error in scrape endpoint: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/parse", methods=["POST"])
 def parse():
+    """
+    Enhanced parse endpoint with better error handling and timeouts
+    """
     file = request.files.get("file")
     space_id = request.form.get("space_id")
 
     if not file or not space_id:
         return jsonify({"error": "Missing file or space_id"}), 400
 
-    file_path = f"/tmp/{file.filename}"
-    file.save(file_path)
-
+    # Create unique temporary directory for this request
+    import uuid
+    temp_dir = f"/tmp/pdf_processing_{uuid.uuid4()}"
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, file.filename)
+    
     try:
-        # 1. Extract text
-        parsed_text = parse_pdf_text(file_path)
+        # Save file with timeout protection
+        with timeout(seconds=30):
+            file.save(file_path)
+            
+        result = {"status": "processing"}
+        
+        # 1. Extract text with timeout
+        try:
+            with timeout(seconds=120):  # 2 minutes timeout for text extraction
+                parsed_text = parse_pdf_text(file_path)
+                result["text"] = parsed_text
+        except TimeoutError:
+            result["text_error"] = "Text extraction timed out"
+            logger.error("Text extraction timed out")
+        except Exception as e:
+            result["text_error"] = str(e)
+            logger.error(f"Text extraction error: {str(e)}")
 
-        # 2. Extract and upload images
-        image_paths = extract_images_from_pdf(file_path)
-        image_upload_result = send_images_to_rails(image_paths, space_id)
+        # 2. Extract and upload images with timeout
+        try:
+            with timeout(seconds=180):  # 3 minutes timeout for image processing
+                image_paths = extract_images_from_pdf(file_path, os.path.join(temp_dir, "images"))
+                if image_paths:
+                    image_upload_result = send_images_to_rails(image_paths, space_id)
+                    result["image_upload_result"] = image_upload_result
+        except TimeoutError:
+            result["image_error"] = "Image processing timed out"
+            logger.error("Image processing timed out")
+        except Exception as e:
+            result["image_error"] = str(e)
+            logger.error(f"Image processing error: {str(e)}")
 
-        return jsonify({
-            "text": parsed_text,
-            "image_upload_result": image_upload_result
-        })
+        return jsonify(result)
 
+    except TimeoutError:
+        return jsonify({"error": "Request timed out"}), 504
     except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-
     finally:
-        os.remove(file_path)
+        # Clean up temporary files
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            logger.error(f"Error cleaning up temporary files: {str(e)}")
