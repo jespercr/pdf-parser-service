@@ -17,16 +17,25 @@ from bs4 import BeautifulSoup
 import re
 import time
 from contextlib import timeout
+import gc
+import uuid
+import shutil
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # Change from DEBUG to INFO
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Disable verbose logging from PDF processing libraries
+logging.getLogger('pdfminer').setLevel(logging.WARNING)
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('fitz').setLevel(logging.WARNING)
+logging.getLogger('pdfplumber').setLevel(logging.WARNING)
 
 app = Flask(__name__)
 CORS(app)
@@ -50,45 +59,47 @@ MAX_SCRAPE_TIME = 10  # 10 seconds total max time
 
 @app.before_request
 def log_request_info():
-    logger.info("=== New Request ===")
-    logger.info(f"Method: {request.method}")
-    logger.info(f"URL: {request.url}")
-    logger.info(f"Headers: {dict(request.headers)}")
+    """Log only essential request information"""
+    logger.info(f"New request: {request.method} {request.url}")
     if request.is_json:
-        logger.info(f"JSON Body: {request.get_json()}")
-    logger.info("==================")
+        logger.info(f"Processing JSON request for URL: {request.get_json().get('url', 'No URL provided')}")
+    elif request.files:
+        logger.info(f"Processing file upload: {request.files.get('file').filename if request.files.get('file') else 'No file'}")
 
 def parse_pdf_text(pdf_path):
-    """
-    Parse PDF text with optimized memory usage and timeout protection
-    """
+    """Parse PDF text with optimized memory usage and timeout protection"""
     text = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
             total_pages = len(pdf.pages)
+            logger.info(f"Starting PDF text extraction: {total_pages} pages")
+            
             # Process in chunks of 10 pages
             for i in range(0, total_pages, 10):
+                chunk_end = min(i + 10, total_pages)
+                logger.info(f"Processing pages {i+1}-{chunk_end}")
                 chunk = pdf.pages[i:i+10]
-                for page in chunk:
+                
+                for page_num, page in enumerate(chunk, start=i):
                     try:
-                        # Add timeout protection for each page
                         with timeout(seconds=30):
                             page_text = page.extract_text() or ""
                             text.append(page_text)
                     except TimeoutError:
-                        logger.warning(f"Timeout extracting text from page {i}")
-                        text.append(f"[Error: Timeout processing page {i}]")
+                        logger.warning(f"Timeout on page {page_num + 1}")
+                        text.append(f"[Error: Timeout on page {page_num + 1}]")
                     except Exception as e:
-                        logger.error(f"Error processing page {i}: {str(e)}")
-                        text.append(f"[Error processing page {i}]")
+                        logger.error(f"Error on page {page_num + 1}: {str(e)}")
+                        text.append(f"[Error on page {page_num + 1}]")
                 
                 # Clear memory after each chunk
                 del chunk
-                import gc
                 gc.collect()
-                
+            
+            logger.info("PDF text extraction completed")
+            
     except Exception as e:
-        logger.error(f"Error parsing PDF: {str(e)}")
+        logger.error(f"PDF parsing failed: {str(e)}")
         raise
         
     return "\n\n".join(text).strip()
@@ -113,24 +124,28 @@ class timeout:
         signal.alarm(0)
 
 def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
-    """
-    Extract images with optimized memory usage and timeout protection
-    """
+    """Extract images with optimized memory usage and timeout protection"""
     os.makedirs(output_dir, exist_ok=True)
     image_paths = []
     
     try:
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
+        logger.info(f"Starting image extraction: {total_pages} pages")
         
         # Process in chunks of 5 pages
         for start_page in range(0, total_pages, 5):
             try:
-                with timeout(seconds=30):  # 30 second timeout per chunk
+                with timeout(seconds=30):
                     end_page = min(start_page + 5, total_pages)
+                    logger.info(f"Processing images from pages {start_page+1}-{end_page}")
+                    
                     for page_num in range(start_page, end_page):
                         page = doc[page_num]
                         images = page.get_images(full=True)
+                        
+                        if images:
+                            logger.info(f"Found {len(images)} images on page {page_num + 1}")
                         
                         for i, img in enumerate(images):
                             try:
@@ -139,9 +154,9 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
                                 image_bytes = base_image["image"]
                                 ext = base_image["ext"]
                                 
-                                # Skip if image is too large (e.g., > 10MB)
+                                # Skip if image is too large
                                 if len(image_bytes) > 10 * 1024 * 1024:
-                                    logger.warning(f"Skipping large image on page {page_num}")
+                                    logger.warning(f"Skipping large image ({len(image_bytes)/1024/1024:.1f}MB) on page {page_num + 1}")
                                     continue
                                     
                                 img_filename = f"page{page_num+1}_img{i+1}.{ext}"
@@ -157,22 +172,23 @@ def extract_images_from_pdf(pdf_path, output_dir="/tmp/pdf_images"):
                                 del base_image
                                 
                             except Exception as e:
-                                logger.error(f"Error extracting image {i} from page {page_num}: {str(e)}")
+                                logger.error(f"Failed to extract image {i+1} from page {page_num + 1}: {str(e)}")
                                 continue
                         
                         # Clear page from memory
                         page = None
                         
                 # Force garbage collection after each chunk
-                import gc
                 gc.collect()
                         
             except TimeoutError:
-                logger.warning(f"Timeout processing pages {start_page}-{end_page}")
+                logger.warning(f"Timeout processing images on pages {start_page+1}-{end_page}")
                 continue
                 
+        logger.info(f"Image extraction completed. Found {len(image_paths)} images")
+                
     except Exception as e:
-        logger.error(f"Error in image extraction: {str(e)}")
+        logger.error(f"Image extraction failed: {str(e)}")
         raise
     finally:
         if 'doc' in locals():
@@ -633,20 +649,20 @@ def scrape():
 
 @app.route("/parse", methods=["POST"])
 def parse():
-    """
-    Enhanced parse endpoint with better error handling and timeouts
-    """
+    """Enhanced parse endpoint with better error handling and timeouts"""
+    start_time = time.time()
     file = request.files.get("file")
     space_id = request.form.get("space_id")
 
     if not file or not space_id:
         return jsonify({"error": "Missing file or space_id"}), 400
 
-    # Create unique temporary directory for this request
-    import uuid
+    # Create unique temporary directory
     temp_dir = f"/tmp/pdf_processing_{uuid.uuid4()}"
     os.makedirs(temp_dir, exist_ok=True)
     file_path = os.path.join(temp_dir, file.filename)
+    
+    logger.info(f"Starting PDF processing for file: {file.filename}")
     
     try:
         # Save file with timeout protection
@@ -655,9 +671,9 @@ def parse():
             
         result = {"status": "processing"}
         
-        # 1. Extract text with timeout
+        # Extract text with timeout
         try:
-            with timeout(seconds=120):  # 2 minutes timeout for text extraction
+            with timeout(seconds=120):
                 parsed_text = parse_pdf_text(file_path)
                 result["text"] = parsed_text
         except TimeoutError:
@@ -665,13 +681,14 @@ def parse():
             logger.error("Text extraction timed out")
         except Exception as e:
             result["text_error"] = str(e)
-            logger.error(f"Text extraction error: {str(e)}")
+            logger.error(f"Text extraction failed: {str(e)}")
 
-        # 2. Extract and upload images with timeout
+        # Extract and upload images with timeout
         try:
-            with timeout(seconds=180):  # 3 minutes timeout for image processing
+            with timeout(seconds=180):
                 image_paths = extract_images_from_pdf(file_path, os.path.join(temp_dir, "images"))
                 if image_paths:
+                    logger.info(f"Uploading {len(image_paths)} images")
                     image_upload_result = send_images_to_rails(image_paths, space_id)
                     result["image_upload_result"] = image_upload_result
         except TimeoutError:
@@ -679,11 +696,14 @@ def parse():
             logger.error("Image processing timed out")
         except Exception as e:
             result["image_error"] = str(e)
-            logger.error(f"Image processing error: {str(e)}")
+            logger.error(f"Image processing failed: {str(e)}")
 
+        processing_time = time.time() - start_time
+        logger.info(f"PDF processing completed in {processing_time:.1f} seconds")
         return jsonify(result)
 
     except TimeoutError:
+        logger.error("Request timed out")
         return jsonify({"error": "Request timed out"}), 504
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
@@ -691,7 +711,7 @@ def parse():
     finally:
         # Clean up temporary files
         try:
-            import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info("Cleaned up temporary files")
         except Exception as e:
-            logger.error(f"Error cleaning up temporary files: {str(e)}")
+            logger.error(f"Failed to clean up temporary files: {str(e)}")
