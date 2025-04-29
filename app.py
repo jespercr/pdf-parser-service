@@ -90,12 +90,18 @@ def is_scraping_allowed(url):
 
 def scrape_with_playwright(url):
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
-        content = page.content()
-        browser.close()
-        return content
+        try:
+            # Use Playwright's built-in timeout parameter
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            content = page.content()
+            return content
+        except Exception as e:
+            print(f"Error scraping {url}: {str(e)}")
+            return None
+        finally:
+            browser.close()
 
 
 def extract_emails(text):
@@ -121,17 +127,17 @@ def is_valid_url(url):
 def scrape_page_with_playwright(url):
     """Scrape a page using Playwright."""
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         try:
             page.goto(url, wait_until="networkidle", timeout=20000)
             content = page.content()
-            browser.close()
             return content
         except Exception as e:
             print(f"Error scraping {url}: {str(e)}")
-            browser.close()
             return None
+        finally:
+            browser.close()
 
 def scrape_emails_from_page(url, visited=None, depth=0, max_depth=2):
     """Recursively scrape emails from pages."""
@@ -313,11 +319,12 @@ def extract_style_attributes(soup):
 
 def extract_content_with_playwright(url):
     """Extract content using Playwright for JavaScript-rendered pages."""
-    browser = None
     with sync_playwright() as p:
+        browser = None
         try:
-            browser = p.chromium.launch()
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
+            # Use Playwright's built-in timeout
             page.goto(url, wait_until='networkidle', timeout=30000)
             
             # Execute JavaScript to get computed styles
@@ -356,9 +363,6 @@ def extract_content_with_playwright(url):
                 }
             """)
             
-            if browser:
-                browser.close()
-                
             return {
                 'html': content,
                 'title': title,
@@ -367,9 +371,11 @@ def extract_content_with_playwright(url):
                 'computed_styles': computed_styles
             }
         except Exception as e:
+            print(f"Failed to extract content: {str(e)}")
+            raise
+        finally:
             if browser:
                 browser.close()
-            raise Exception(f"Failed to extract content: {str(e)}")
 
 def find_logo(soup, base_url):
     """Extract potential logo URLs from the page."""
