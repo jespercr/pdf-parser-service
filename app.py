@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 import json
 import cssutils
 import tinycss2
+import signal
 
 app = Flask(__name__)
 CORS(app)
