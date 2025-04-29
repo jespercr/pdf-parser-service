@@ -313,6 +313,7 @@ def extract_style_attributes(soup):
 
 def extract_content_with_playwright(url):
     """Extract content using Playwright for JavaScript-rendered pages."""
+    browser = None
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch()
@@ -355,7 +356,9 @@ def extract_content_with_playwright(url):
                 }
             """)
             
-            browser.close()
+            if browser:
+                browser.close()
+                
             return {
                 'html': content,
                 'title': title,
@@ -366,7 +369,7 @@ def extract_content_with_playwright(url):
         except Exception as e:
             if browser:
                 browser.close()
-            raise e
+            raise Exception(f"Failed to extract content: {str(e)}")
 
 def find_logo(soup, base_url):
     """Extract potential logo URLs from the page."""
