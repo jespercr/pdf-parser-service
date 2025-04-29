@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import urllib.robotparser
 from utils.robots import is_scraping_allowed
 from flask_cors import CORS
@@ -8,6 +8,11 @@ import os
 import fitz  # PyMuPDF
 import requests
 import pdfplumber
+import re
+from bs4 import BeautifulSoup
+import json
+import cssutils
+import tinycss2
 
 app = Flask(__name__)
 CORS(app)
@@ -93,7 +98,88 @@ def scrape_with_playwright(url):
         return content
 
 
+def extract_emails(text):
+    """Extract email addresses from text using regex."""
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z]{2,}\b'
+    return list(set(re.findall(email_pattern, text, re.IGNORECASE)))
 
+def get_absolute_url(base, link):
+    """Convert relative URL to absolute URL."""
+    try:
+        return urljoin(base, link)
+    except:
+        return None
+
+def is_valid_url(url):
+    """Check if URL is valid and has acceptable scheme."""
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc]) and result.scheme in ['http', 'https']
+    except:
+        return False
+
+def scrape_page_with_playwright(url):
+    """Scrape a page using Playwright."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url, wait_until="networkidle", timeout=20000)
+            content = page.content()
+            browser.close()
+            return content
+        except Exception as e:
+            print(f"Error scraping {url}: {str(e)}")
+            browser.close()
+            return None
+
+def scrape_emails_from_page(url, visited=None, depth=0, max_depth=2):
+    """Recursively scrape emails from pages."""
+    if visited is None:
+        visited = set()
+    if depth > max_depth or url in visited or not is_valid_url(url):
+        return []
+    
+    visited.add(url)
+    print(f"Visiting: {url} (depth: {depth})")
+    
+    try:
+        # Get page content using Playwright
+        content = scrape_page_with_playwright(url)
+        if not content:
+            return []
+        
+        # Parse with BeautifulSoup
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # Extract emails from text content
+        emails = extract_emails(soup.get_text())
+        
+        # Extract emails from href attributes
+        hrefs = [a.get('href', '') for a in soup.find_all('a')]
+        emails.extend(extract_emails(' '.join(hrefs)))
+        
+        # Find potential contact pages
+        contact_links = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            text = a.get_text().lower()
+            if any(word in text or word in href.lower() 
+                  for word in ['contact', 'about', 'support', 'help', 'kontakt', 'om-oss']):
+                full_url = get_absolute_url(url, href)
+                if full_url and is_valid_url(full_url):
+                    contact_links.append(full_url)
+        
+        # Recursively check contact pages
+        for link in contact_links:
+            if link not in visited:
+                emails.extend(scrape_emails_from_page(link, visited, depth + 1, max_depth))
+        
+        return list(set(emails))
+    
+    except Exception as e:
+        print(f"Error processing {url}: {str(e)}")
+        return []
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
@@ -141,3 +227,235 @@ def parse():
 
     finally:
         os.remove(file_path)
+
+@app.route("/deepscrape", methods=["POST"])
+def deepscrape():
+    data = request.get_json()
+    url = data.get("url")
+    
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+    
+    if not is_scraping_allowed(url):
+        return jsonify({"error": "Scraping disallowed by robots.txt"}), 403
+    
+    try:
+        # First get basic page content
+        content = scrape_page_with_playwright(url)
+        if not content:
+            return jsonify({"error": "Failed to fetch page content"}), 500
+        
+        # Parse with BeautifulSoup for basic content
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # Get all emails from the site
+        emails = scrape_emails_from_page(url)
+        
+        # Extract basic page information
+        title = soup.title.string if soup.title else ""
+        meta_desc = soup.find('meta', {'name': 'description'})
+        meta_description = meta_desc['content'] if meta_desc else ""
+        
+        # Get main content
+        main_content = ""
+        main_tags = soup.find_all(['main', 'article']) or soup.find_all('div', class_=lambda x: x and ('content' in x.lower() or 'main' in x.lower()))
+        if main_tags:
+            main_content = main_tags[0].get_text(strip=True)
+        else:
+            main_content = soup.body.get_text(strip=True) if soup.body else ""
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "title": title,
+                "meta_description": meta_description,
+                "content": main_content,
+                "emails": emails
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+def fetch_css_content(url, base_url):
+    """Fetch CSS content from a URL, handling both relative and absolute URLs."""
+    try:
+        if not url.startswith(('http://', 'https://')):
+            url = urljoin(base_url, url)
+        response = requests.get(url, timeout=10)
+        return response.text if response.ok else None
+    except Exception as e:
+        print(f"Error fetching CSS from {url}: {str(e)}")
+        return None
+
+def extract_stylesheets(soup, base_url):
+    """Extract all stylesheet URLs from the page."""
+    stylesheet_links = []
+    for link in soup.find_all('link', rel='stylesheet'):
+        href = link.get('href')
+        if href:
+            if not href.startswith(('http://', 'https://')):
+                href = urljoin(base_url, href)
+            stylesheet_links.append(href)
+    return stylesheet_links
+
+def extract_inline_styles(soup):
+    """Extract inline styles from style tags."""
+    return ' '.join(style.string or '' for style in soup.find_all('style'))
+
+def extract_style_attributes(soup):
+    """Extract styles from style attributes."""
+    styles = []
+    for tag in soup.find_all(style=True):
+        styles.append(tag['style'])
+    return ' '.join(styles)
+
+
+def extract_content_with_playwright(url):
+    """Extract content using Playwright for JavaScript-rendered pages."""
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(url, wait_until='networkidle', timeout=30000)
+            
+            # Execute JavaScript to get computed styles
+            computed_styles = page.evaluate("""
+                () => {
+                    const styles = [];
+                    const elements = document.querySelectorAll('*');
+                    elements.forEach(el => {
+                        const style = window.getComputedStyle(el);
+                        styles.push({
+                            color: style.color,
+                            backgroundColor: style.backgroundColor,
+                            fontFamily: style.fontFamily
+                        });
+                    });
+                    return styles;
+                }
+            """)
+            
+            content = page.content()
+            title = page.title()
+            
+            # Extract meta description
+            meta_desc = page.evaluate("""
+                () => {
+                    const meta = document.querySelector('meta[name="description"]');
+                    return meta ? meta.getAttribute('content') : '';
+                }
+            """)
+            
+            # Get main content
+            main_content = page.evaluate("""
+                () => {
+                    const main = document.querySelector('main, article, .main, #main');
+                    return main ? main.textContent : document.body.textContent;
+                }
+            """)
+            
+            browser.close()
+            return {
+                'html': content,
+                'title': title,
+                'meta_description': meta_desc,
+                'main_content': main_content,
+                'computed_styles': computed_styles
+            }
+        except Exception as e:
+            if browser:
+                browser.close()
+            raise e
+
+def find_logo(soup, base_url):
+    """Extract potential logo URLs from the page."""
+    logo_candidates = []
+    
+    # Common logo selectors
+    logo_selectors = [
+        '.logo img', '#logo img', '[class*="logo"] img', '[id*="logo"] img',
+        'header img', '.header img', '#header img',
+        '.brand img', '#brand img', '.navbar-brand img',
+        'img[alt*="logo"]', 'img[src*="logo"]'
+    ]
+    
+    for selector in logo_selectors:
+        for img in soup.select(selector):
+            src = img.get('src')
+            if src:
+                # Convert relative URLs to absolute
+                if not src.startswith(('http://', 'https://')):
+                    src = urljoin(base_url, src)
+                logo_candidates.append(src)
+    
+    # Remove duplicates while preserving order
+    return list(dict.fromkeys(logo_candidates))
+
+@app.route("/structured_scrape", methods=["POST"])
+def structured_scrape():
+    """
+    Comprehensive website scraping endpoint that handles:
+    - Content extraction (with JavaScript rendering)
+    - CSS extraction
+    - Logo extraction
+    - Meta information
+    """
+    try:
+        data = request.get_json()
+        url = data.get('url')
+        
+        if not url:
+            return jsonify({"error": "URL is required"}), 400
+
+        # Get the base content using Playwright
+        content_data = extract_content_with_playwright(url)
+        
+        # Parse the HTML content
+        soup = BeautifulSoup(content_data['html'], 'html.parser')
+        
+        # Extract all CSS content
+        css_content = []
+        
+        # 1. External stylesheets
+        stylesheet_urls = extract_stylesheets(soup, url)
+        for css_url in stylesheet_urls:
+            css_text = fetch_css_content(css_url, url)
+            if css_text:
+                css_content.append(css_text)
+        
+        # 2. Inline styles
+        css_content.append(extract_inline_styles(soup))
+        
+        # 3. Style attributes
+        css_content.append(extract_style_attributes(soup))
+        
+        # 4. Computed styles from JavaScript
+        computed_styles = content_data['computed_styles']
+        
+        # Combine all CSS content
+        combined_css = '\n'.join(css_content)
+        
+        # Extract logo URLs
+        logo_urls = find_logo(soup, url)
+        
+        # Prepare the final response
+        response_data = {
+            "success": True,
+            "data": {
+                "title": content_data['title'],
+                "meta_description": content_data['meta_description'],
+                "content": content_data['main_content'],
+                "css": {
+                    "raw_css": combined_css,
+                    "computed_styles": computed_styles[:100]  # Limit to first 100 elements
+                },
+                "logo_urls": logo_urls[:5]  # Limit to top 5 candidates
+            }
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        print(f"Error in structured_scrape: {str(e)}")
+        return jsonify({"error": str(e)}), 500

@@ -5,3 +5,6 @@ flask-cors
 PyMuPDF
 requests
 playwright
+beautifulsoup4==4.12.3
+cssutils==2.9.0
+tinycss2==1.2.1
