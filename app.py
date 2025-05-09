@@ -14,6 +14,11 @@ import json
 import cssutils
 import tinycss2
 import signal
+import time
+from functools import wraps
+from queue import Queue
+from threading import Lock
+import random
 
 app = Flask(__name__)
 CORS(app)
@@ -25,6 +30,72 @@ RAILS_BASE_URL = "https://workplacerback.onrender.com"
 ORIGIN_URL = "https://workplacer-parser.onrender.com"
 # ==============
 
+# Rate limiting configuration
+RATE_LIMIT_DELAY = 5     # Base delay between requests in seconds
+MAX_RETRIES = 5          # Maximum number of retries for 429 errors
+BACKOFF_FACTOR = 2       # Exponential backoff factor
+JITTER = 0.5            # Random jitter factor to add to delays
+
+# Request queue configuration
+request_queue = Queue()
+queue_lock = Lock()
+last_request_time = 0
+
+def get_user_agent():
+    """Return a proper user agent string"""
+    return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36 WorkplacerBot/1.0"
+
+def add_jitter(delay):
+    """Add random jitter to delay time"""
+    return delay * (1 + random.uniform(-JITTER, JITTER))
+
+def rate_limited(f):
+    """Decorator to implement rate limiting with queuing"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        global last_request_time
+        
+        with queue_lock:
+            current_time = time.time()
+            time_since_last_request = current_time - last_request_time
+            
+            if time_since_last_request < RATE_LIMIT_DELAY:
+                sleep_time = add_jitter(RATE_LIMIT_DELAY - time_since_last_request)
+                time.sleep(sleep_time)
+            
+            last_request_time = time.time()
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                if attempt > 0:
+                    # Exponential backoff with jitter
+                    wait_time = add_jitter(RATE_LIMIT_DELAY * (BACKOFF_FACTOR ** attempt))
+                    time.sleep(wait_time)
+                    print(f"Retry attempt {attempt + 1} after {wait_time:.2f}s delay")
+                
+                return f(*args, **kwargs)
+            
+            except requests.exceptions.RequestException as e:
+                if hasattr(e.response, 'status_code'):
+                    if e.response.status_code == 429:
+                        retry_after = e.response.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after)
+                            except (ValueError, TypeError):
+                                wait_time = RATE_LIMIT_DELAY * (BACKOFF_FACTOR ** attempt)
+                        else:
+                            wait_time = RATE_LIMIT_DELAY * (BACKOFF_FACTOR ** attempt)
+                        
+                        if attempt == MAX_RETRIES - 1:
+                            raise Exception(f"Rate limit exceeded after {MAX_RETRIES} attempts")
+                        
+                        print(f"Rate limit hit, waiting {wait_time}s before retry")
+                        time.sleep(wait_time)
+                        continue
+                raise
+        return None
+    return wrapper
 
 def parse_pdf_text(pdf_path):
     text = ""
@@ -90,19 +161,39 @@ def is_scraping_allowed(url):
 
 
 def scrape_with_playwright(url):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    """Scrape a page using Playwright with rate limiting."""
+    for attempt in range(MAX_RETRIES):
         try:
-            # Use Playwright's built-in timeout parameter
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            content = page.content()
-            return content
+            if attempt > 0:
+                wait_time = add_jitter(RATE_LIMIT_DELAY * (BACKOFF_FACTOR ** attempt))
+                time.sleep(wait_time)
+                print(f"Retry attempt {attempt + 1} after {wait_time:.2f}s delay")
+            
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=get_user_agent(),
+                    viewport={'width': 1920, 'height': 1080}
+                )
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    content = page.content()
+                    return content
+                except Exception as e:
+                    if "net::ERR_TOO_MANY_REQUESTS" in str(e):
+                        if attempt == MAX_RETRIES - 1:
+                            raise Exception(f"Rate limit exceeded after {MAX_RETRIES} attempts")
+                        continue
+                    print(f"Error scraping {url}: {str(e)}")
+                    raise
+                finally:
+                    context.close()
+                    browser.close()
         except Exception as e:
-            print(f"Error scraping {url}: {str(e)}")
-            return None
-        finally:
-            browser.close()
+            if attempt == MAX_RETRIES - 1:
+                raise
+    return None
 
 
 def extract_emails(text):
@@ -284,16 +375,27 @@ def deepscrape():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@rate_limited
 def fetch_css_content(url, base_url):
     """Fetch CSS content from a URL, handling both relative and absolute URLs."""
     try:
         if not url.startswith(('http://', 'https://')):
             url = urljoin(base_url, url)
-        response = requests.get(url, timeout=10)
+        
+        headers = {
+            'User-Agent': get_user_agent(),
+            'Accept': 'text/css,*/*;q=0.1',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Origin': ORIGIN_URL
+        }
+        
+        response = requests.get(url, timeout=10, headers=headers)
+        if response.status_code == 429:
+            raise requests.exceptions.RequestException(response=response)
         return response.text if response.ok else None
     except Exception as e:
         print(f"Error fetching CSS from {url}: {str(e)}")
-        return None
+        raise
 
 def extract_stylesheets(soup, base_url):
     """Extract all stylesheet URLs from the page."""
